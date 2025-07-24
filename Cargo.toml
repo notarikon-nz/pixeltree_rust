@@ -4,7 +4,7 @@ version = "0.2.1"
 edition = "2024"
 authors = ["Matt Orsborn"]
 description = "A high-performance procedural 2D tree generator for pixel-art games, built with Bevy. Generate beautiful, wind-animated trees with automatic LOD and spatial culling."
-
+repository = "https://github.com/notarikon-nz/pixeltree_rust"
 
 [dependencies]
 bevy = "0.16.1"
