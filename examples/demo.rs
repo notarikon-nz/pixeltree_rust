@@ -39,10 +39,11 @@ fn main() {
             fps_system,
             tree_optimization_system,
         ))
-        .add_systems(Last, force_high_lod) // Override LOD at the very end of each frame
+        .add_systems(Last, dynamic_lod_system) // Adjust LOD based on zoom and distance
         .add_systems(Startup, (
             setup_gpu_leaf_instances.after(setup_demo),
             setup_branch_sprites.after(setup_demo),
+            setup_trunk_sprites.after(setup_demo),
         ))
         .run();
 }
@@ -136,6 +137,30 @@ fn setup_demo(
     spawn_forest(&mut commands, forest_positions, forest_params, &mut spatial_index);
     println!("Spawned background forest with {} trees", 15);
     
+    // Try to load STF forest if available
+    if let Ok(entities) = spawn_forest_from_stf(
+        &mut commands,
+        "examples/sample_forest.stf",
+        GenerationParams {
+            template: TreeTemplate::Default,
+            height_range: (70.0, 120.0),
+            wind_params: WindParams {
+                strength: 1.8,
+                frequency: 1.0,
+                turbulence: 0.3,
+                direction: Vec2::new(0.7, 0.4),
+            },
+            leaf_density: 2.5,
+            lod_level: 0,
+            ..default()
+        },
+        &mut spatial_index,
+    ) {
+        println!("Loaded STF forest with {} trees from sample_forest.stf", entities.len());
+    } else {
+        println!("Could not load STF forest (sample_forest.stf not found or invalid)");
+    }
+    
     println!("Demo setup complete! Use WASD to move camera.");
 }
 
@@ -218,6 +243,11 @@ struct LeafSprite {
 
 #[derive(Component)]
 struct BranchSprite {
+    tree_entity: Entity,
+}
+
+#[derive(Component)]
+struct TrunkSprite {
     tree_entity: Entity,
 }
 
@@ -388,6 +418,9 @@ fn tree_info_display(
              G: Regenerate selected tree\n\
              S: Toggle shadows\n\
              O: Optimize selected tree\n\
+             L: Load STF forest\n\
+             P: Save selected tree (.pt)\n\
+             M: iMport tree from .pt file\n\
              \n\
              Camera: ({:.0}, {:.0})",
             fps_counter.fps,
@@ -424,7 +457,7 @@ fn render_trees(
         // Calculate actual viewport bounds based on window size and zoom
         let viewport_width = 1200.0 / zoom.0; // Actual window width divided by zoom
         let viewport_height = 800.0 / zoom.0; // Actual window height divided by zoom
-        let viewport_bounds = Rect::from_center_size(
+        let _viewport_bounds = Rect::from_center_size(
             camera_pos, 
             Vec2::new(viewport_width, viewport_height)
         );
@@ -436,7 +469,7 @@ fn render_trees(
             Vec2::new(viewport_width + margin * 2.0, viewport_height + margin * 2.0)
         );
         
-        for (tree_transform, tree) in tree_query.iter() {
+        for (tree_transform, _tree) in tree_query.iter() {
             let tree_pos = tree_transform.translation.truncate();
             
             // Proper viewport culling - skip trees outside viewport
@@ -444,22 +477,7 @@ fn render_trees(
                 continue;
             }
             
-            // Render trunk segments only for visible trees
-            let trunk_color = Color::srgb(0.4, 0.2, 0.1); // Brown
-            for segment in &tree.trunk.segments {
-                let start = tree_pos + segment.start;
-                let end = tree_pos + segment.end;
-                
-                // Draw trunk as thick lines
-                for i in 0..(segment.width as i32) {
-                    let offset = i as f32 - segment.width * 0.5;
-                    gizmos.line_2d(
-                        start + Vec2::new(offset, 0.0),
-                        end + Vec2::new(offset, 0.0),
-                        trunk_color
-                    );
-                }
-            }
+            // Trunk rendering is now done via sprites, no gizmo rendering needed
             
             // Draw tree base circle for debugging visible trees only
             gizmos.circle_2d(tree_pos, 5.0, Color::srgba(1.0, 1.0, 1.0, 0.3));
@@ -477,7 +495,7 @@ fn setup_gpu_leaf_instances(
     
     // Create a quad mesh for instanced rendering
     let quad_mesh = Mesh::from(Rectangle::new(1.0, 1.0));
-    let mesh_handle = meshes.add(quad_mesh);
+    let _mesh_handle = meshes.add(quad_mesh);
     
     // Create GPU leaf instances for all trees and spawn them as actual sprites for now
     for (tree_entity, tree_transform, tree) in tree_query.iter() {
@@ -660,12 +678,53 @@ fn setup_branch_sprites(
     }
 }
 
+fn setup_trunk_sprites(
+    mut commands: Commands,
+    tree_query: Query<(Entity, &Transform, &PixelTree)>,
+) {
+    println!("Setting up trunk sprites once at startup...");
+    
+    // Create trunk sprites for all trees once at startup
+    for (tree_entity, tree_transform, tree) in tree_query.iter() {
+        let tree_pos = tree_transform.translation.truncate();
+        
+        // Create sprites for each trunk segment
+        for segment in &tree.trunk.segments {
+            let start = tree_pos + segment.start;
+            let end = tree_pos + segment.end;
+            
+            let center = (start + end) / 2.0;
+            let length = start.distance(end);
+            let angle = (end - start).angle_to(Vec2::X);
+            
+            let trunk_color = Color::srgb(0.4, 0.2, 0.1); // Brown trunk color
+            let thickness = segment.width.max(3.0); // Ensure minimum thickness
+            
+            // Create a stretched rectangle sprite for each trunk segment
+            commands.spawn((
+                Sprite {
+                    color: trunk_color,
+                    ..default()
+                },
+                Transform {
+                    translation: center.extend(-0.5), // Lower Z than branches (0.0)
+                    rotation: Quat::from_rotation_z(angle),
+                    scale: Vec3::new(length, thickness, 1.0),
+                },
+                TrunkSprite {
+                    tree_entity, // Track which tree this trunk belongs to
+                },
+            ));
+        }
+    }
+}
+
 // Old sprite animation system removed - using GPU instancing instead
 
 fn tree_selection_system(
     mut selected_tree: ResMut<SelectedTree>,
     camera_query: Query<(&Transform, &CameraZoom), (With<Camera>, Without<PixelTree>)>,
-    tree_query: Query<(Entity, &Transform), With<PixelTree>>,
+    tree_query: Query<(Entity, &Transform, &PixelTree)>,
     mut gizmos: Gizmos,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
@@ -680,7 +739,7 @@ fn tree_selection_system(
         let mut closest_entity = None;
         let mut closest_distance = f32::MAX;
         
-        for (entity, tree_transform) in tree_query.iter() {
+        for (entity, tree_transform, _) in tree_query.iter() {
             let tree_pos = tree_transform.translation.truncate();
             let distance = camera_pos.distance(tree_pos);
             
@@ -696,7 +755,7 @@ fn tree_selection_system(
         
         // Draw selection indicator around the closest tree
         if let Some(selected_entity) = selected_tree.entity {
-            if let Ok((_, tree_transform)) = tree_query.get(selected_entity) {
+            if let Ok((_, tree_transform, _)) = tree_query.get(selected_entity) {
                 let tree_pos = tree_transform.translation.truncate();
                 
                 // Draw pulsing selection circle
@@ -727,10 +786,123 @@ fn tree_selection_system(
         // Handle tree optimization (O key)
         if keyboard.just_pressed(KeyCode::KeyO) {
             if let Some(selected_entity) = selected_tree.entity {
-                if let Ok((_, tree_transform)) = tree_query.get(selected_entity) {
+                if let Ok((_, tree_transform, _)) = tree_query.get(selected_entity) {
                     let tree_pos = tree_transform.translation.truncate();
                     println!("Optimizing tree at {:?}", tree_pos);
                     commands.spawn(OptimizeTreeMarker { entity: selected_entity });
+                }
+            }
+        }
+
+        // Handle STF forest loading (L key for Load)
+        if keyboard.just_pressed(KeyCode::KeyL) {
+            println!("Loading STF forest...");
+            match spawn_forest_from_stf(
+                &mut commands,
+                "examples/sample_forest.stf",
+                GenerationParams {
+                    template: TreeTemplate::Default,
+                    height_range: (80.0, 130.0),
+                    wind_params: WindParams {
+                        strength: 2.2,
+                        frequency: 1.1,
+                        turbulence: 0.35,
+                        direction: Vec2::new(0.8, 0.3),
+                    },
+                    leaf_density: 3.0,
+                    lod_level: 0,
+                    ..default()
+                },
+                &mut spatial_index,
+            ) {
+                Ok(entities) => {
+                    println!("Successfully loaded STF forest with {} trees", entities.len());
+                },
+                Err(e) => {
+                    println!("Failed to load STF forest: {}", e);
+                }
+            }
+        }
+
+        // Handle tree saving (P key for Pixeltree format)
+        if keyboard.just_pressed(KeyCode::KeyP) {
+            if let Some(selected_entity) = selected_tree.entity {
+                if let Ok((_, tree_transform, pixeltree)) = tree_query.get(selected_entity) {
+                    let tree_pos = tree_transform.translation.truncate();
+                    println!("Saving selected tree at {:?} to .pt format...", tree_pos);
+                    
+                    // Create generation params for the tree (approximated)
+                    let params = GenerationParams {
+                        seed: 12345, // Could store this in the tree component
+                        template: pixeltree.template,
+                        height_range: (pixeltree.trunk.height * 0.8, pixeltree.trunk.height * 1.2),
+                        trunk_width_range: (pixeltree.trunk.base_width * 0.8, pixeltree.trunk.base_width * 1.2),
+                        wind_params: pixeltree.wind_params.clone(),
+                        lod_level: pixeltree.lod_level,
+                        ..default()
+                    };
+                    
+                    let filename = format!("examples/{:?}_tree_{:.0}_{:.0}.pt", 
+                        pixeltree.template, tree_pos.x, tree_pos.y);
+                    
+                    match PtFileManager::save_tree(pixeltree, &params, &filename, None) {
+                        Ok(()) => {
+                            println!("Successfully saved tree to {}", filename);
+                        },
+                        Err(e) => {
+                            println!("Failed to save tree: {}", e);
+                        }
+                    }
+                }
+            } else {
+                println!("No tree selected. Select a tree first by moving camera close to it.");
+            }
+        }
+
+        // Handle tree loading from .pt format (M key for eMport)
+        if keyboard.just_pressed(KeyCode::KeyM) {
+            println!("Loading tree from .pt format...");
+            
+            // Try to load an existing .pt file
+            let test_files = vec![
+                "examples/sample_Oak_tree.pt",
+                "examples/sample_Pine_tree.pt", 
+                "examples/sample_Willow_tree.pt",
+                "examples/sample_Default_tree.pt",
+            ];
+            
+            for filename in test_files {
+                match PtFileManager::load_tree(filename) {
+                    Ok((loaded_tree, _params)) => {
+                        println!("Successfully loaded tree from {}", filename);
+                        
+                        // Spawn the loaded tree at a new position
+                        let spawn_pos = Vec3::new(0.0, -200.0, 0.0);
+                        
+                        let entity = commands.spawn((
+                            Transform::from_translation(spawn_pos),
+                            GlobalTransform::default(),
+                            loaded_tree,
+                            Visibility::default(),
+                            InheritedVisibility::default(),
+                            ViewVisibility::default(),
+                        )).id();
+                        
+                        spatial_index.insert(entity, spawn_pos.truncate());
+                        
+                        // Trigger sprite creation for the loaded tree
+                        commands.spawn(RegeneratedTreeMarker { 
+                            entity,
+                            old_entity: entity, // Same entity since it's new
+                        });
+                        
+                        println!("Loaded tree spawned at {:?}", spawn_pos);
+                        break; // Only load the first found file
+                    },
+                    Err(_) => {
+                        // Try next file
+                        continue;
+                    }
                 }
             }
         }
@@ -738,7 +910,7 @@ fn tree_selection_system(
         // Handle regeneration key (G for Generate)
         if keyboard.just_pressed(KeyCode::KeyG) {
             if let Some(selected_entity) = selected_tree.entity {
-                if let Ok((_, tree_transform)) = tree_query.get(selected_entity) {
+                if let Ok((_, tree_transform, _)) = tree_query.get(selected_entity) {
                     let tree_pos = tree_transform.translation.truncate();
                     println!("Regenerating tree at {:?}", tree_pos);
                     
@@ -785,6 +957,7 @@ fn handle_regenerated_trees(
     marker_query: Query<(Entity, &RegeneratedTreeMarker)>,
     leaf_gpu_query: Query<(Entity, &LeafGpu), Without<PixelTree>>,
     branch_sprite_query: Query<(Entity, &BranchSprite)>,
+    trunk_sprite_query: Query<(Entity, &TrunkSprite)>,
 ) {
     // Handle trees that were regenerated and need sprites
     for (marker_entity, marker) in marker_query.iter() {
@@ -811,7 +984,16 @@ fn handle_regenerated_trees(
                 }
             }
             
-            println!("Despawned {} old leaf sprites and {} old branch sprites", despawned_leaf_count, despawned_branch_count);
+            // Also despawn ALL old trunk sprites for this tree
+            let mut despawned_trunk_count = 0;
+            for (trunk_entity, trunk_sprite) in trunk_sprite_query.iter() {
+                if trunk_sprite.tree_entity == marker.old_entity {
+                    commands.entity(trunk_entity).despawn();
+                    despawned_trunk_count += 1;
+                }
+            }
+            
+            println!("Despawned {} old leaf sprites, {} old branch sprites, and {} old trunk sprites", despawned_leaf_count, despawned_branch_count, despawned_trunk_count);
             
             // Now create all new leaf sprites for the regenerated tree
             let mut created_leaf_count = 0;
@@ -880,7 +1062,37 @@ fn handle_regenerated_trees(
                 created_branch_count += 1;
             }
             
-            println!("Created {} new leaf sprites and {} new branch sprites", created_leaf_count, created_branch_count);
+            // Create new trunk sprites for the regenerated tree
+            let mut created_trunk_count = 0;
+            for segment in &tree.trunk.segments {
+                let start = tree_pos + segment.start;
+                let end = tree_pos + segment.end;
+                
+                let center = (start + end) / 2.0;
+                let length = start.distance(end);
+                let angle = (end - start).angle_to(Vec2::X);
+                
+                let trunk_color = Color::srgb(0.4, 0.2, 0.1); // Brown trunk color
+                let thickness = segment.width.max(3.0); // Ensure minimum thickness
+                
+                commands.spawn((
+                    Sprite {
+                        color: trunk_color,
+                        ..default()
+                    },
+                    Transform {
+                        translation: center.extend(-0.5), // Lower Z than branches
+                        rotation: Quat::from_rotation_z(angle),
+                        scale: Vec3::new(length, thickness, 1.0),
+                    },
+                    TrunkSprite {
+                        tree_entity,
+                    },
+                ));
+                created_trunk_count += 1;
+            }
+            
+            println!("Created {} new leaf sprites, {} new branch sprites, and {} new trunk sprites", created_leaf_count, created_branch_count, created_trunk_count);
         }
         
         // Remove the marker since we've handled it
@@ -981,6 +1193,7 @@ fn tree_optimization_system(
     marker_query: Query<(Entity, &OptimizeTreeMarker)>,
     _leaf_sprite_query: Query<Entity, With<LeafSprite>>,
     _branch_sprite_query: Query<Entity, With<BranchSprite>>,
+    _trunk_sprite_query: Query<Entity, With<TrunkSprite>>,
 ) {
     for (marker_entity, marker) in marker_query.iter() {
         if let Ok(mut tree) = tree_query.get_mut(marker.entity) {
@@ -1053,11 +1266,34 @@ fn tree_optimization_system(
     }
 }
 
-fn force_high_lod(mut tree_query: Query<&mut PixelTree>) {
-    // Force all trees to stay at LOD level 0 (high detail) for demo
-    for mut tree in tree_query.iter_mut() {
-        if tree.lod_level != 0 {
-            tree.lod_level = 0;
+fn dynamic_lod_system(
+    mut tree_query: Query<(&Transform, &mut PixelTree)>,
+    camera_query: Query<(&Transform, &CameraZoom), With<Camera>>,
+) {
+    if let Ok((camera_transform, zoom)) = camera_query.single() {
+        let camera_pos = camera_transform.translation.truncate();
+        
+        for (tree_transform, mut tree) in tree_query.iter_mut() {
+            let tree_pos = tree_transform.translation.truncate();
+            let distance = camera_pos.distance(tree_pos);
+            
+            // Calculate LOD based on distance and zoom level
+            let effective_distance = distance / zoom.0; // Closer when zoomed in
+            
+            let new_lod = if effective_distance < 200.0 {
+                0 // High detail - close up
+            } else if effective_distance < 600.0 {
+                1 // Medium detail
+            } else if effective_distance < 1200.0 {
+                2 // Low detail
+            } else {
+                3 // Minimum detail - very far
+            };
+            
+            // Only update if LOD changed to avoid unnecessary updates
+            if tree.lod_level != new_lod {
+                tree.lod_level = new_lod;
+            }
         }
     }
 }
