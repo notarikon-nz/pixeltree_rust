@@ -41,6 +41,7 @@ fn main() {
 }
 
 fn setup(
+
     mut commands: Commands,
     mut spatial_index: ResMut<TreeSpatialIndex>,
 ) {
@@ -122,9 +123,12 @@ fn render_visible_trees(
 ```toml
 [dependencies]
 bevy = "0.16.1"
-rand = "0.8"
+bevy_light_2d = "0.7"
+rand = { version = "0.8", features = ["small_rng"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 rayon = "1.7"
+
 ```
 
 ## License
