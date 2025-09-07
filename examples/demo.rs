@@ -128,7 +128,7 @@ fn setup_demo(
             turbulence: 0.2,
             direction: Vec2::new(0.8, 0.3),
         },
-        leaf_density: 3.0, // 3x more leaves for forest too
+        leaf_density: 4.0, // 3x more leaves for forest too
         lod_level: 0, // High detail for all trees initially
         ..default()
     };
@@ -217,7 +217,9 @@ struct LeafSprite {
 }
 
 #[derive(Component)]
-struct BranchSprite;
+struct BranchSprite {
+    tree_entity: Entity,
+}
 
 #[derive(Component)]
 struct ShadowCaster;
@@ -225,6 +227,7 @@ struct ShadowCaster;
 #[derive(Component)]
 struct RegeneratedTreeMarker {
     entity: Entity,
+    old_entity: Entity, // Track the old entity that was despawned
 }
 
 #[derive(Component)]
@@ -309,7 +312,7 @@ impl Default for LeafSpritePool {
 fn tree_info_display(
     mut commands: Commands,
     tree_query: Query<(&Transform, &PixelTree)>,
-    camera_query: Query<&Transform, (With<Camera>, Without<PixelTree>)>,
+    camera_query: Query<(&Transform, &CameraZoom), (With<Camera>, Without<PixelTree>)>,
     spatial_index: Res<TreeSpatialIndex>,
     existing_text: Query<Entity, With<TreeInfoText>>,
     selected_tree: Res<SelectedTree>,
@@ -330,9 +333,11 @@ fn tree_info_display(
         commands.entity(entity).despawn();
     }
     
-    if let Ok(camera_transform) = camera_query.single() {
+    if let Ok((camera_transform, zoom)) = camera_query.single() {
         let camera_pos = camera_transform.translation.truncate();
-        let view_bounds = Rect::from_center_size(camera_pos, Vec2::new(1200.0, 800.0));
+        let viewport_width = 1200.0 / zoom.0;
+        let viewport_height = 800.0 / zoom.0;
+        let view_bounds = Rect::from_center_size(camera_pos, Vec2::new(viewport_width, viewport_height));
         
         let visible_trees = spatial_index.get_visible_trees(view_bounds);
         let total_trees = tree_query.iter().count();
@@ -415,17 +420,31 @@ fn render_trees(
 ) {
     if let Ok((camera_transform, zoom)) = camera_query.single() {
         let camera_pos = camera_transform.translation.truncate();
-        let view_distance = 1500.0 / zoom.0; // Adjust culling based on zoom (inverted)
+        
+        // Calculate actual viewport bounds based on window size and zoom
+        let viewport_width = 1200.0 / zoom.0; // Actual window width divided by zoom
+        let viewport_height = 800.0 / zoom.0; // Actual window height divided by zoom
+        let viewport_bounds = Rect::from_center_size(
+            camera_pos, 
+            Vec2::new(viewport_width, viewport_height)
+        );
+        
+        // Add small margin to avoid pop-in
+        let margin = 100.0 / zoom.0;
+        let culling_bounds = Rect::from_center_size(
+            camera_pos,
+            Vec2::new(viewport_width + margin * 2.0, viewport_height + margin * 2.0)
+        );
         
         for (tree_transform, tree) in tree_query.iter() {
             let tree_pos = tree_transform.translation.truncate();
             
-            // Skip trees too far from camera for performance - dynamic distance based on zoom
-            if camera_pos.distance(tree_pos) > view_distance {
+            // Proper viewport culling - skip trees outside viewport
+            if !culling_bounds.contains(tree_pos) {
                 continue;
             }
             
-            // Render trunk segments
+            // Render trunk segments only for visible trees
             let trunk_color = Color::srgb(0.4, 0.2, 0.1); // Brown
             for segment in &tree.trunk.segments {
                 let start = tree_pos + segment.start;
@@ -442,15 +461,7 @@ fn render_trees(
                 }
             }
             
-            // Branches are now rendered as sprites for proper Z-ordering
-            // Only render debug info if no branches exist
-            if tree.branches.is_empty() {
-                println!("WARNING: Tree at {:?} has NO branches!", tree_pos);
-            }
-            
-            // No gizmo leaf rendering - all leaves are sprites
-            
-            // Draw tree base circle for debugging
+            // Draw tree base circle for debugging visible trees only
             gizmos.circle_2d(tree_pos, 5.0, Color::srgba(1.0, 1.0, 1.0, 0.3));
         }
     }
@@ -532,7 +543,7 @@ fn update_leaf_instances(
     tree_query: Query<(Entity, &Transform, &PixelTree)>,
     mut leaf_sprite_query: Query<(&mut Transform, &LeafGpu), Without<PixelTree>>,
     mut leaf_renderer: ResMut<LeafInstancedRenderer>,
-    camera_query: Query<&Transform, (With<Camera>, Without<PixelTree>, Without<LeafGpu>)>,
+    camera_query: Query<(&Transform, &CameraZoom), (With<Camera>, Without<PixelTree>, Without<LeafGpu>)>,
     mut animation_timer: Local<f32>,
 ) {
     // Throttle animation updates for performance
@@ -544,12 +555,21 @@ fn update_leaf_instances(
     
     let elapsed = time.elapsed_secs();
     
-    // Get camera position for culling
-    let camera_pos = if let Ok(cam_transform) = camera_query.single() {
-        cam_transform.translation.truncate()
+    // Get camera data for viewport culling
+    let (camera_pos, zoom_level) = if let Ok((cam_transform, cam_zoom)) = camera_query.single() {
+        (cam_transform.translation.truncate(), cam_zoom.0)
     } else {
-        Vec2::ZERO
+        (Vec2::ZERO, 1.0)
     };
+    
+    // Calculate viewport bounds for culling - same logic as render_trees
+    let viewport_width = 1200.0 / zoom_level;
+    let viewport_height = 800.0 / zoom_level;
+    let margin = 150.0 / zoom_level; // Slightly larger margin for animation
+    let animation_bounds = Rect::from_center_size(
+        camera_pos,
+        Vec2::new(viewport_width + margin * 2.0, viewport_height + margin * 2.0)
+    );
     
     // Update all leaf sprites with animation
     let mut instance_index = 0;
@@ -557,8 +577,8 @@ fn update_leaf_instances(
         if let Ok((_, tree_transform, tree)) = tree_query.get(leaf_gpu.tree_entity) {
             let tree_pos = tree_transform.translation.truncate();
             
-            // Distance culling for performance
-            if camera_pos.distance(tree_pos) > 1200.0 {
+            // Viewport culling for performance - skip trees outside viewport
+            if !animation_bounds.contains(tree_pos) {
                 instance_index += 1;
                 continue;
             }
@@ -606,7 +626,7 @@ fn setup_branch_sprites(
     println!("Setting up branch sprites once at startup...");
     
     // Create branch sprites for all trees once at startup  
-    for (_tree_entity, tree_transform, tree) in tree_query.iter() {
+    for (tree_entity, tree_transform, tree) in tree_query.iter() {
         let tree_pos = tree_transform.translation.truncate();
         
         // Create sprites for each branch
@@ -632,7 +652,9 @@ fn setup_branch_sprites(
                     rotation: Quat::from_rotation_z(angle),
                     scale: Vec3::new(length, thickness, 1.0),
                 },
-                BranchSprite,
+                BranchSprite {
+                    tree_entity, // Track which tree this branch belongs to
+                },
             ));
         }
     }
@@ -642,7 +664,7 @@ fn setup_branch_sprites(
 
 fn tree_selection_system(
     mut selected_tree: ResMut<SelectedTree>,
-    camera_query: Query<&Transform, (With<Camera>, Without<PixelTree>)>,
+    camera_query: Query<(&Transform, &CameraZoom), (With<Camera>, Without<PixelTree>)>,
     tree_query: Query<(Entity, &Transform), With<PixelTree>>,
     mut gizmos: Gizmos,
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -651,7 +673,7 @@ fn tree_selection_system(
     time: Res<Time>,
     mut shadow_settings: ResMut<ShadowSettings>,
 ) {
-    if let Ok(camera_transform) = camera_query.single() {
+    if let Ok((camera_transform, _zoom)) = camera_query.single() {
         let camera_pos = camera_transform.translation.truncate();
         
         // Find the tree closest to camera center (viewport center)
@@ -720,6 +742,9 @@ fn tree_selection_system(
                     let tree_pos = tree_transform.translation.truncate();
                     println!("Regenerating tree at {:?}", tree_pos);
                     
+                    // Store the old entity before despawning
+                    let old_entity = selected_entity;
+                    
                     // Despawn the old tree and associated sprites
                     commands.entity(selected_entity).despawn();
                     
@@ -743,7 +768,10 @@ fn tree_selection_system(
                     let new_tree_entity = spawn_tree(&mut commands, tree_pos.extend(0.0), params, &mut spatial_index);
                     
                     // We need to trigger sprite regeneration in the next frame since the tree data isn't available yet
-                    commands.spawn(RegeneratedTreeMarker { entity: new_tree_entity });
+                    commands.spawn(RegeneratedTreeMarker { 
+                        entity: new_tree_entity,
+                        old_entity, // Pass the old entity so we can find its orphaned sprites
+                    });
                     println!("New tree spawned!");
                 }
             }
@@ -755,48 +783,39 @@ fn handle_regenerated_trees(
     mut commands: Commands,
     tree_query: Query<(Entity, &Transform, &PixelTree)>,
     marker_query: Query<(Entity, &RegeneratedTreeMarker)>,
-    mut leaf_gpu_query: Query<(&mut Transform, &mut LeafGpu), Without<PixelTree>>,
-    branch_sprite_query: Query<Entity, With<BranchSprite>>,
+    leaf_gpu_query: Query<(Entity, &LeafGpu), Without<PixelTree>>,
+    branch_sprite_query: Query<(Entity, &BranchSprite)>,
 ) {
     // Handle trees that were regenerated and need sprites
     for (marker_entity, marker) in marker_query.iter() {
         if let Ok((tree_entity, tree_transform, tree)) = tree_query.get(marker.entity) {
             let tree_pos = tree_transform.translation.truncate();
             
-            println!("Efficiently updating GPU leaf sprites for regenerated tree at {:?}", tree_pos);
+            println!("Cleaning up old sprites and creating new ones for regenerated tree at {:?}", tree_pos);
             
-            // Update existing leaf sprites for this specific tree
-            let mut updated_sprites = 0;
-            for (mut transform, mut leaf_gpu) in leaf_gpu_query.iter_mut() {
-                if leaf_gpu.tree_entity == marker.entity {
-                    // This sprite belongs to the regenerated tree
-                    if updated_sprites < tree.leaves.leaves.len() {
-                        let leaf = &tree.leaves.leaves[updated_sprites];
-                        let leaf_pos = tree_pos + leaf.pos;
-                        
-                        let scale = (leaf.scale * 8.0).max(5.0);
-                        
-                        // Update the existing sprite
-                        transform.translation = leaf_pos.extend(1.0);
-                        transform.rotation = Quat::from_rotation_z(leaf.rot.to_radians());
-                        transform.scale = Vec3::splat(scale);
-                        
-                        // Update GPU component
-                        leaf_gpu.base_position = leaf.pos;
-                        leaf_gpu.base_rotation = leaf.rot;
-                        leaf_gpu.tree_entity = tree_entity;
-                        
-                        updated_sprites += 1;
-                    } else {
-                        // More existing sprites than new leaves, hide this sprite
-                        transform.scale = Vec3::ZERO;
-                    }
+            // First, despawn ALL old leaf sprites for this tree to avoid orphaned sprites
+            let mut despawned_leaf_count = 0;
+            for (leaf_entity, leaf_gpu) in leaf_gpu_query.iter() {
+                if leaf_gpu.tree_entity == marker.old_entity {
+                    commands.entity(leaf_entity).despawn();
+                    despawned_leaf_count += 1;
                 }
             }
             
-            // If we need more sprites than existing ones, create new ones
-            for i in updated_sprites..tree.leaves.leaves.len() {
-                let leaf = &tree.leaves.leaves[i];
+            // Also despawn ALL old branch sprites for this tree
+            let mut despawned_branch_count = 0;
+            for (branch_entity, branch_sprite) in branch_sprite_query.iter() {
+                if branch_sprite.tree_entity == marker.old_entity {
+                    commands.entity(branch_entity).despawn();
+                    despawned_branch_count += 1;
+                }
+            }
+            
+            println!("Despawned {} old leaf sprites and {} old branch sprites", despawned_leaf_count, despawned_branch_count);
+            
+            // Now create all new leaf sprites for the regenerated tree
+            let mut created_leaf_count = 0;
+            for leaf in &tree.leaves.leaves {
                 let leaf_pos = tree_pos + leaf.pos;
                 
                 // Calculate proper lighting
@@ -828,11 +847,40 @@ fn handle_regenerated_trees(
                         base_rotation: leaf.rot,
                     },
                 ));
+                created_leaf_count += 1;
             }
             
-            // DON'T despawn ALL branch sprites - this was the bug!
-            // Branch sprites are shared across all trees, so don't touch them during regeneration
-            // The gizmo rendering in render_trees handles the branches dynamically
+            // Create new branch sprites for the regenerated tree
+            let mut created_branch_count = 0;
+            for branch in &tree.branches {
+                let start = tree_pos + branch.start;
+                let end = tree_pos + branch.end;
+                
+                let center = (start + end) / 2.0;
+                let length = start.distance(end);
+                let angle = (end - start).angle_to(Vec2::X);
+                
+                let branch_color = Color::srgb(0.6, 0.3, 0.1);
+                let thickness = branch.thickness.max(2.0);
+                
+                commands.spawn((
+                    Sprite {
+                        color: branch_color,
+                        ..default()
+                    },
+                    Transform {
+                        translation: center.extend(0.0),
+                        rotation: Quat::from_rotation_z(angle),
+                        scale: Vec3::new(length, thickness, 1.0),
+                    },
+                    BranchSprite {
+                        tree_entity,
+                    },
+                ));
+                created_branch_count += 1;
+            }
+            
+            println!("Created {} new leaf sprites and {} new branch sprites", created_leaf_count, created_branch_count);
         }
         
         // Remove the marker since we've handled it
@@ -994,7 +1042,10 @@ fn tree_optimization_system(
             );
             
             // Trigger sprite regeneration for the optimized tree
-            commands.spawn(RegeneratedTreeMarker { entity: marker.entity });
+            commands.spawn(RegeneratedTreeMarker { 
+                entity: marker.entity,
+                old_entity: marker.entity, // For optimization, old and new are the same
+            });
         }
         
         // Remove the marker
