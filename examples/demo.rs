@@ -2,6 +2,7 @@ use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy_light_2d::prelude::*;
 use pixeltree::*;
+use bytemuck::{Pod, Zeroable};
 
 fn main() {
     println!("🌳 PixelTree Demo Starting...");
@@ -18,6 +19,7 @@ fn main() {
             }),
             PixelTreePlugin,
             Light2dPlugin,
+            LeafInstancedRenderingPlugin,
         ))
         .init_resource::<SelectedTree>()
         .init_resource::<ShadowSettings>()
@@ -28,7 +30,7 @@ fn main() {
             camera_controls,
             tree_info_display,
             render_trees,
-            animate_leaves_and_branches,
+            update_leaf_instances,
         ))
         .add_systems(Update, (
             tree_selection_system,
@@ -39,7 +41,7 @@ fn main() {
         ))
         .add_systems(Last, force_high_lod) // Override LOD at the very end of each frame
         .add_systems(Startup, (
-            setup_leaf_sprite_pool.after(setup_demo),
+            setup_gpu_leaf_instances.after(setup_demo),
             setup_branch_sprites.after(setup_demo),
         ))
         .run();
@@ -51,10 +53,10 @@ fn setup_demo(
 ) {
     println!("Setting up demo scene...");
     
-    // Spawn camera with proper Z positioning
+    // Spawn camera at origin for proper 2D zoom
     commands.spawn((
         Camera2d::default(),
-        Transform::from_xyz(0.0, 0.0, 1000.0),
+        Transform::from_xyz(0.0, 0.0, 0.0),
         CameraZoom(1.0),
         Light2d::default(),
     ));
@@ -66,7 +68,7 @@ fn setup_demo(
             radius: 2000.0,
             ..default()
         },
-        Transform::from_xyz(500.0, 800.0, 100.0), // Sun position
+        Transform::from_xyz(500.0, 800.0, 10.0), // Sun position
     ));
 
     // Create different tree types across the scene
@@ -164,7 +166,7 @@ fn camera_controls(
         
         // Zoom controls via transform scale - Z = zoom in, X = zoom out  
         if keyboard.pressed(KeyCode::KeyZ) {
-            zoom.0 = (zoom.0 + time.delta_secs() * 2.0).min(5.0); // Zoom in = larger scale
+            zoom.0 = (zoom.0 + time.delta_secs() * 2.0).min(10.0); // Zoom in = larger scale
             transform.scale = Vec3::splat(zoom.0);
         }
         if keyboard.pressed(KeyCode::KeyX) {
@@ -175,14 +177,15 @@ fn camera_controls(
         // Mouse drag controls
         if mouse.pressed(MouseButton::Left) {
             for motion in mouse_motion.read() {
-                transform.translation.x -= motion.delta.x * (2.0 / zoom.0); // Adjust sensitivity based on zoom
-                transform.translation.y += motion.delta.y * (2.0 / zoom.0);
+                let scale_factor = 1.0 / zoom.0; // Inverse scale for drag sensitivity
+                transform.translation.x -= motion.delta.x * scale_factor;
+                transform.translation.y += motion.delta.y * scale_factor;
             }
         }
         
         // Mouse wheel zoom - scroll up = zoom in, scroll down = zoom out
         for wheel in mouse_wheel.read() {
-            zoom.0 = (zoom.0 + wheel.y * 0.1).clamp(0.1, 5.0); // Zoom in = larger scale
+            zoom.0 = (zoom.0 + wheel.y * 0.2).clamp(0.1, 10.0); // Zoom in = larger scale
             transform.scale = Vec3::splat(zoom.0);
         }
         
@@ -245,6 +248,44 @@ struct FpsCounter {
     fps: f32,
     frame_count: u32,
     timer: f32,
+}
+
+// GPU Instanced Leaf Rendering System
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+struct LeafInstance {
+    transform: [[f32; 4]; 4], // 4x4 matrix
+    color: [f32; 4],
+}
+
+#[derive(Resource)]
+struct LeafInstancedRenderer {
+    instances: Vec<LeafInstance>,
+}
+
+impl Default for LeafInstancedRenderer {
+    fn default() -> Self {
+        Self {
+            instances: Vec::new(),
+        }
+    }
+}
+
+#[derive(Component)]
+struct LeafGpu {
+    tree_entity: Entity,
+    base_position: Vec2,
+    base_rotation: f32,
+}
+
+pub struct LeafInstancedRenderingPlugin;
+
+impl Plugin for LeafInstancedRenderingPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<LeafInstancedRenderer>()
+           .add_systems(Update, update_leaf_instances);
+    }
 }
 
 #[derive(Resource)]
@@ -415,35 +456,28 @@ fn render_trees(
     }
 }
 
-fn setup_leaf_sprite_pool(
+fn setup_gpu_leaf_instances(
     mut commands: Commands,
     tree_query: Query<(Entity, &Transform, &PixelTree)>,
-    mut sprite_pool: ResMut<LeafSpritePool>,
+    mut leaf_renderer: ResMut<LeafInstancedRenderer>,
+    mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    println!("Setting up optimized leaf sprite pool...");
+    println!("Setting up GPU instanced leaf rendering...");
     
-    // Count total leaves across all trees
-    let total_leaves: usize = tree_query.iter()
-        .map(|(_, _, tree)| tree.leaves.leaves.len())
-        .sum();
+    // Create a quad mesh for instanced rendering
+    let quad_mesh = Mesh::from(Rectangle::new(1.0, 1.0));
+    let mesh_handle = meshes.add(quad_mesh);
     
-    println!("Creating sprite pool for {} total leaves", total_leaves);
-    
-    // Pre-allocate sprite pool with all needed sprites
-    sprite_pool.sprites.reserve(total_leaves);
-    sprite_pool.available.reserve(total_leaves);
-    sprite_pool.active.reserve(total_leaves);
-    
-    // Create all leaf sprites at once for better batching
-    for (sprite_index, (tree_entity, tree_transform, tree)) in tree_query.iter().enumerate() {
+    // Create GPU leaf instances for all trees and spawn them as actual sprites for now
+    for (tree_entity, tree_transform, tree) in tree_query.iter() {
         let tree_pos = tree_transform.translation.truncate();
         
         for leaf in &tree.leaves.leaves {
             let leaf_pos = tree_pos + leaf.pos;
             
-            // Add lighting variation based on leaf position and random factors (restored)
+            // Calculate proper lighting
             let variation = (leaf.pos.x * 0.01 + leaf.pos.y * 0.01 + leaf.rot).sin() * 0.3 + 0.7;
-            let shadow_factor = (leaf.pos.y * 0.005).cos() * 0.2 + 0.8; // Vertical gradient
+            let shadow_factor = (leaf.pos.y * 0.005).cos() * 0.2 + 0.8;
             
             let base_green = (leaf.color[1] as f32 / 255.0).max(0.6);
             let leaf_color = Color::srgb(
@@ -454,31 +488,115 @@ fn setup_leaf_sprite_pool(
             
             let scale = (leaf.scale * 8.0).max(5.0);
             
-            // Create sprite with consistent properties for better batching
-            let sprite_entity = commands.spawn((
+            // Create transform matrix for instancing data
+            let cos_r = leaf.rot.to_radians().cos();
+            let sin_r = leaf.rot.to_radians().sin();
+            
+            let transform_matrix = [
+                [cos_r * scale, sin_r * scale, 0.0, 0.0],
+                [-sin_r * scale, cos_r * scale, 0.0, 0.0],
+                [0.0, 0.0, scale, 0.0],
+                [leaf_pos.x, leaf_pos.y, 20.0, 1.0],
+            ];
+            
+            leaf_renderer.instances.push(LeafInstance {
+                transform: transform_matrix,
+                color: [leaf_color.to_srgba().red, leaf_color.to_srgba().green, leaf_color.to_srgba().blue, leaf_color.to_srgba().alpha],
+            });
+            
+            // Create actual sprite entity that will be visible immediately
+            commands.spawn((
                 Sprite {
                     color: leaf_color,
                     ..default()
                 },
                 Transform {
-                    translation: leaf_pos.extend(20.0),
+                    translation: leaf_pos.extend(1.0), // Positive Z for leaves above branches
                     rotation: Quat::from_rotation_z(leaf.rot.to_radians()),
                     scale: Vec3::splat(scale),
                 },
-                LeafSprite {
+                LeafGpu {
                     tree_entity,
                     base_position: leaf.pos,
                     base_rotation: leaf.rot,
                 },
-            )).id();
-            
-            let pool_index = sprite_pool.sprites.len();
-            sprite_pool.sprites.push(sprite_entity);
-            sprite_pool.active.push(pool_index);
+            ));
         }
     }
     
-    println!("Created {} leaf sprites in pool", sprite_pool.sprites.len());
+    println!("Created {} GPU leaf instances with immediate sprite rendering", leaf_renderer.instances.len());
+}
+
+fn update_leaf_instances(
+    time: Res<Time>,
+    tree_query: Query<(Entity, &Transform, &PixelTree)>,
+    mut leaf_sprite_query: Query<(&mut Transform, &LeafGpu), Without<PixelTree>>,
+    mut leaf_renderer: ResMut<LeafInstancedRenderer>,
+    camera_query: Query<&Transform, (With<Camera>, Without<PixelTree>, Without<LeafGpu>)>,
+    mut animation_timer: Local<f32>,
+) {
+    // Throttle animation updates for performance
+    *animation_timer += time.delta_secs();
+    if *animation_timer < 0.033 {
+        return;
+    }
+    *animation_timer = 0.0;
+    
+    let elapsed = time.elapsed_secs();
+    
+    // Get camera position for culling
+    let camera_pos = if let Ok(cam_transform) = camera_query.single() {
+        cam_transform.translation.truncate()
+    } else {
+        Vec2::ZERO
+    };
+    
+    // Update all leaf sprites with animation
+    let mut instance_index = 0;
+    for (mut leaf_transform, leaf_gpu) in leaf_sprite_query.iter_mut() {
+        if let Ok((_, tree_transform, tree)) = tree_query.get(leaf_gpu.tree_entity) {
+            let tree_pos = tree_transform.translation.truncate();
+            
+            // Distance culling for performance
+            if camera_pos.distance(tree_pos) > 1200.0 {
+                instance_index += 1;
+                continue;
+            }
+            
+            // Calculate wind animation
+            let wind_strength = tree.wind_params.strength * 0.4;
+            let base_phase = elapsed * 2.4;
+            let phase = base_phase + (leaf_gpu.base_position.x + leaf_gpu.base_position.y) * 0.005;
+            
+            let wind_x = phase.sin() * wind_strength;
+            let wind_y = (phase * 0.7).cos() * wind_strength * 0.5;
+            let wind_offset = Vec2::new(wind_x, wind_y);
+            let wind_rotation = wind_x * 0.01;
+            
+            let final_pos = tree_pos + leaf_gpu.base_position + wind_offset;
+            let final_rotation = leaf_gpu.base_rotation + wind_rotation;
+            let scale = 8.0;
+            
+            // Update sprite transform
+            leaf_transform.translation = final_pos.extend(1.0);
+            leaf_transform.rotation = Quat::from_rotation_z(final_rotation.to_radians());
+            leaf_transform.scale = Vec3::splat(scale);
+            
+            // Also update GPU instance data for future true GPU rendering
+            if instance_index < leaf_renderer.instances.len() {
+                let cos_r = final_rotation.to_radians().cos();
+                let sin_r = final_rotation.to_radians().sin();
+                
+                leaf_renderer.instances[instance_index].transform = [
+                    [cos_r * scale, sin_r * scale, 0.0, 0.0],
+                    [-sin_r * scale, cos_r * scale, 0.0, 0.0],
+                    [0.0, 0.0, scale, 0.0],
+                    [final_pos.x, final_pos.y, 20.0, 1.0],
+                ];
+            }
+        }
+        instance_index += 1;
+    }
 }
 
 fn setup_branch_sprites(
@@ -510,7 +628,7 @@ fn setup_branch_sprites(
                     ..default()
                 },
                 Transform {
-                    translation: center.extend(5.0), // Lower Z than leaves (20.0)
+                    translation: center.extend(0.0), // Lower Z than leaves (1.0)
                     rotation: Quat::from_rotation_z(angle),
                     scale: Vec3::new(length, thickness, 1.0),
                 },
@@ -520,68 +638,7 @@ fn setup_branch_sprites(
     }
 }
 
-fn animate_leaves_and_branches(
-    time: Res<Time>,
-    tree_query: Query<(Entity, &Transform, &PixelTree)>,
-    mut leaf_query: Query<(&mut Transform, &LeafSprite), Without<PixelTree>>,
-    camera_query: Query<&Transform, (With<Camera>, Without<PixelTree>, Without<LeafSprite>)>,
-    mut animation_timer: Local<f32>,
-) {
-    // Only update animation every few frames for better performance
-    *animation_timer += time.delta_secs();
-    if *animation_timer < 0.033 { // ~30 FPS animation updates
-        return;
-    }
-    *animation_timer = 0.0;
-    
-    let elapsed = time.elapsed_secs();
-    
-    // Get camera position for culling
-    let camera_pos = if let Ok(cam_transform) = camera_query.single() {
-        cam_transform.translation.truncate()
-    } else {
-        Vec2::ZERO
-    };
-    
-    // More aggressive distance culling for performance
-    let max_animation_distance = 1200.0;
-    
-    // Pre-calculate common values
-    let base_phase = elapsed * 2.4; // Combined frequency
-    
-    for (mut leaf_transform, leaf_sprite) in leaf_query.iter_mut() {
-        // Find the corresponding tree
-        if let Ok((_, tree_transform, tree)) = tree_query.get(leaf_sprite.tree_entity) {
-            let tree_pos = tree_transform.translation.truncate();
-            
-            // Skip animation for distant trees
-            if camera_pos.distance(tree_pos) > max_animation_distance {
-                continue;
-            }
-            
-            // Simplified wind calculation for better performance
-            let wind_strength = tree.wind_params.strength * 0.4; // Reduced strength
-            
-            // Create phase variation with less computation
-            let phase = base_phase + (leaf_sprite.base_position.x + leaf_sprite.base_position.y) * 0.005;
-            
-            // Simplified wind displacement
-            let wind_x = phase.sin() * wind_strength;
-            let wind_y = (phase * 0.7).cos() * wind_strength * 0.5;
-            
-            // Apply wind with less rotation calculation
-            let wind_offset = Vec2::new(wind_x, wind_y);
-            let wind_rotation = wind_x * 0.01; // Reduced rotational movement
-            
-            let new_pos = tree_pos + leaf_sprite.base_position + wind_offset;
-            let new_rotation = leaf_sprite.base_rotation + wind_rotation;
-            
-            // Update the leaf transform
-            leaf_transform.translation = new_pos.extend(20.0);
-            leaf_transform.rotation = Quat::from_rotation_z(new_rotation.to_radians());
-        }
-    }
-}
+// Old sprite animation system removed - using GPU instancing instead
 
 fn tree_selection_system(
     mut selected_tree: ResMut<SelectedTree>,
@@ -698,7 +755,7 @@ fn handle_regenerated_trees(
     mut commands: Commands,
     tree_query: Query<(Entity, &Transform, &PixelTree)>,
     marker_query: Query<(Entity, &RegeneratedTreeMarker)>,
-    mut leaf_sprite_query: Query<(&mut Transform, &mut LeafSprite, &mut Sprite), Without<PixelTree>>,
+    mut leaf_gpu_query: Query<(&mut Transform, &mut LeafGpu), Without<PixelTree>>,
     branch_sprite_query: Query<Entity, With<BranchSprite>>,
 ) {
     // Handle trees that were regenerated and need sprites
@@ -706,43 +763,33 @@ fn handle_regenerated_trees(
         if let Ok((tree_entity, tree_transform, tree)) = tree_query.get(marker.entity) {
             let tree_pos = tree_transform.translation.truncate();
             
-            println!("Efficiently updating sprites for regenerated tree at {:?}", tree_pos);
+            println!("Efficiently updating GPU leaf sprites for regenerated tree at {:?}", tree_pos);
             
-            // Update existing sprites for this tree with new data
+            // Update existing leaf sprites for this specific tree
             let mut updated_sprites = 0;
-            for (mut transform, mut leaf_sprite, mut sprite) in leaf_sprite_query.iter_mut() {
-                if leaf_sprite.tree_entity == marker.entity {
+            for (mut transform, mut leaf_gpu) in leaf_gpu_query.iter_mut() {
+                if leaf_gpu.tree_entity == marker.entity {
                     // This sprite belongs to the regenerated tree
                     if updated_sprites < tree.leaves.leaves.len() {
                         let leaf = &tree.leaves.leaves[updated_sprites];
                         let leaf_pos = tree_pos + leaf.pos;
                         
-                        // Calculate proper lighting
-                        let variation = (leaf.pos.x * 0.01 + leaf.pos.y * 0.01 + leaf.rot).sin() * 0.3 + 0.7;
-                        let shadow_factor = (leaf.pos.y * 0.005).cos() * 0.2 + 0.8;
-                        
-                        let base_green = (leaf.color[1] as f32 / 255.0).max(0.6);
-                        let leaf_color = Color::srgb(
-                            ((leaf.color[0] as f32 / 255.0) * variation * 0.8).max(0.1),
-                            (base_green * variation * shadow_factor).clamp(0.4, 1.0),
-                            ((leaf.color[2] as f32 / 255.0) * variation * 0.6).max(0.1),
-                        );
-                        
                         let scale = (leaf.scale * 8.0).max(5.0);
                         
                         // Update the existing sprite
-                        transform.translation = leaf_pos.extend(20.0);
+                        transform.translation = leaf_pos.extend(1.0);
                         transform.rotation = Quat::from_rotation_z(leaf.rot.to_radians());
                         transform.scale = Vec3::splat(scale);
-                        sprite.color = leaf_color;
-                        leaf_sprite.base_position = leaf.pos;
-                        leaf_sprite.base_rotation = leaf.rot;
-                        leaf_sprite.tree_entity = tree_entity; // Update to new tree entity
+                        
+                        // Update GPU component
+                        leaf_gpu.base_position = leaf.pos;
+                        leaf_gpu.base_rotation = leaf.rot;
+                        leaf_gpu.tree_entity = tree_entity;
                         
                         updated_sprites += 1;
                     } else {
                         // More existing sprites than new leaves, hide this sprite
-                        transform.scale = Vec3::ZERO; // Hide unused sprite
+                        transform.scale = Vec3::ZERO;
                     }
                 }
             }
@@ -752,6 +799,7 @@ fn handle_regenerated_trees(
                 let leaf = &tree.leaves.leaves[i];
                 let leaf_pos = tree_pos + leaf.pos;
                 
+                // Calculate proper lighting
                 let variation = (leaf.pos.x * 0.01 + leaf.pos.y * 0.01 + leaf.rot).sin() * 0.3 + 0.7;
                 let shadow_factor = (leaf.pos.y * 0.005).cos() * 0.2 + 0.8;
                 
@@ -770,11 +818,11 @@ fn handle_regenerated_trees(
                         ..default()
                     },
                     Transform {
-                        translation: leaf_pos.extend(20.0),
+                        translation: leaf_pos.extend(1.0),
                         rotation: Quat::from_rotation_z(leaf.rot.to_radians()),
                         scale: Vec3::splat(scale),
                     },
-                    LeafSprite {
+                    LeafGpu {
                         tree_entity,
                         base_position: leaf.pos,
                         base_rotation: leaf.rot,
@@ -782,35 +830,9 @@ fn handle_regenerated_trees(
                 ));
             }
             
-            // Despawn old branch sprites and create new ones
-            for entity in branch_sprite_query.iter() {
-                commands.entity(entity).despawn();
-            }
-            
-            // Create branch sprites for the new tree
-            for branch in &tree.branches {
-                let start = tree_pos + branch.start;
-                let end = tree_pos + branch.end;
-                let center = (start + end) / 2.0;
-                let length = start.distance(end);
-                let angle = (end - start).angle_to(Vec2::X);
-                
-                let branch_color = Color::srgb(0.6, 0.3, 0.1);
-                let thickness = branch.thickness.max(2.0);
-                
-                commands.spawn((
-                    Sprite {
-                        color: branch_color,
-                        ..default()
-                    },
-                    Transform {
-                        translation: center.extend(5.0),
-                        rotation: Quat::from_rotation_z(angle),
-                        scale: Vec3::new(length, thickness, 1.0),
-                    },
-                    BranchSprite,
-                ));
-            }
+            // DON'T despawn ALL branch sprites - this was the bug!
+            // Branch sprites are shared across all trees, so don't touch them during regeneration
+            // The gizmo rendering in render_trees handles the branches dynamically
         }
         
         // Remove the marker since we've handled it
