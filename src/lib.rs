@@ -82,7 +82,7 @@ pub struct Leaf {
     pub color: [u8; 3], // RGB bytes instead of Color
 }
 
-#[derive(Component, Clone, Debug, Reflect, Serialize, Deserialize)]
+#[derive(Component, Clone, Debug, Default, Reflect, Serialize, Deserialize)]
 pub struct WindParams {
     pub strength: f32,
     pub frequency: f32,
@@ -1221,11 +1221,45 @@ pub enum PtFormatError {
     SerializationError(#[from] bincode::Error),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("File too large: {size} bytes exceeds limit of {limit} bytes")]
+    FileTooLarge { size: u64, limit: u64 },
+    #[error("Invalid file path: {0}")]
+    InvalidPath(String),
+    #[error("Data corruption detected: {0}")]
+    DataCorruption(String),
+    #[error("Invalid tree data: {0}")]
+    InvalidTreeData(String),
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
 }
 
 // ============================================================================
 // PT FORMAT IMPLEMENTATION
 // ============================================================================
+
+// Security and validation constants
+// PT Format Constants
+const MAX_PT_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100MB max file size
+const MIN_PT_FILE_SIZE: u64 = 32; // Minimum viable file size
+const MAX_TREE_NAME_LEN: usize = 256;
+const MAX_AUTHOR_LEN: usize = 128;
+const MAX_DESCRIPTION_LEN: usize = 1024;
+const MAX_CUSTOM_PROPERTIES: usize = 50;
+const MAX_PROPERTY_KEY_LEN: usize = 64;
+const MAX_PROPERTY_VALUE_LEN: usize = 256;
+const MAX_BRANCHES: usize = 10000;
+const MAX_LEAVES: usize = 50000;
+const MAX_TRUNK_SEGMENTS: usize = 1000;
+
+// PTF Format Constants
+const MAX_PTF_FILE_SIZE: u64 = 500 * 1024 * 1024; // 500MB max forest file size
+const MIN_PTF_FILE_SIZE: u64 = 64; // Minimum viable PTF file size
+const MAX_TREE_GROUPS: usize = 1000;
+const MAX_TREE_INSTANCES: usize = 100000;
+const MAX_INSTANCES_PER_GROUP: usize = 50000;
+const MAX_PTF_TAGS: usize = 1000;
+const MAX_PTF_CUSTOM_PROPERTIES: usize = 10000;
+const MAX_TREE_FILE_PATH_LENGTH: usize = 512;
 
 pub struct PtFileManager;
 
@@ -1236,11 +1270,17 @@ impl PtFileManager {
         path: P,
         metadata: Option<PtMetadata>,
     ) -> Result<(), PtFormatError> {
+        // Input validation
+        Self::validate_path(&path)?;
+        Self::validate_tree(tree)?;
+        Self::validate_params(params)?;
+        
         let geometry_data = Self::convert_tree_to_geometry(tree);
         let material_data = Self::extract_materials(tree);
         let lod_levels = Self::create_lod_levels(tree);
         
-        let metadata = metadata.unwrap_or_else(|| Self::default_metadata(&params.template));
+        let mut validated_metadata = metadata.unwrap_or_else(|| Self::default_metadata(&params.template));
+        Self::validate_and_sanitize_metadata(&mut validated_metadata)?;
         
         let pt_file = PixelTreeFile {
             header: PtFileHeader {
@@ -1254,12 +1294,14 @@ impl PtFileManager {
             material_data,
             lod_levels,
             wind_data: tree.wind_params.clone(),
-            metadata,
+            metadata: validated_metadata,
         };
         
         let serialized = if pt_file.header.compression {
             // Use bincode with compression for efficiency
-            bincode::serialize(&pt_file)?
+            bincode::serialize(&pt_file).map_err(|e| {
+                PtFormatError::SerializationError(e)
+            })?
         } else {
             // For debugging, use JSON
             serde_json::to_vec_pretty(&pt_file).map_err(|e| {
@@ -1267,12 +1309,61 @@ impl PtFileManager {
             })?
         };
         
-        std::fs::write(path, serialized)?;
+        // Check serialized size before writing
+        if serialized.len() as u64 > MAX_PT_FILE_SIZE {
+            return Err(PtFormatError::FileTooLarge { 
+                size: serialized.len() as u64, 
+                limit: MAX_PT_FILE_SIZE 
+            });
+        }
+        
+        // Atomic write - write to temporary file first, then rename
+        let temp_path = path.as_ref().with_extension("pt.tmp");
+        std::fs::write(&temp_path, &serialized).map_err(|e| {
+            // Clean up temp file on error
+            let _ = std::fs::remove_file(&temp_path);
+            PtFormatError::IoError(e)
+        })?;
+        
+        // Atomic rename
+        std::fs::rename(&temp_path, &path).map_err(|e| {
+            // Clean up temp file on error
+            let _ = std::fs::remove_file(&temp_path);
+            PtFormatError::IoError(e)
+        })?;
+        
         Ok(())
     }
     
     pub fn load_tree<P: AsRef<Path>>(path: P) -> Result<(PixelTree, GenerationParams), PtFormatError> {
-        let data = std::fs::read(path.as_ref())?;
+        // Input validation
+        Self::validate_path(&path)?;
+        
+        // Check file size
+        let metadata = std::fs::metadata(path.as_ref()).map_err(PtFormatError::IoError)?;
+        let file_size = metadata.len();
+        
+        if file_size < MIN_PT_FILE_SIZE {
+            return Err(PtFormatError::DataCorruption(
+                format!("File too small: {} bytes", file_size)
+            ));
+        }
+        
+        if file_size > MAX_PT_FILE_SIZE {
+            return Err(PtFormatError::FileTooLarge { 
+                size: file_size, 
+                limit: MAX_PT_FILE_SIZE 
+            });
+        }
+        
+        let data = std::fs::read(path.as_ref()).map_err(PtFormatError::IoError)?;
+        
+        // Verify data integrity
+        if data.len() as u64 != file_size {
+            return Err(PtFormatError::DataCorruption(
+                "File size mismatch during read".to_string()
+            ));
+        }
         
         // Try binary first, then JSON fallback
         let pt_file: PixelTreeFile = match bincode::deserialize(&data) {
@@ -1286,25 +1377,22 @@ impl PtFileManager {
         };
         
         // Validate header
-        if pt_file.header.magic != "PIXELTREE" {
-            return Err(PtFormatError::InvalidHeader(format!(
-                "Expected 'PIXELTREE', got '{}'", pt_file.header.magic
-            )));
-        }
+        Self::validate_file_header(&pt_file.header)?;
         
-        // Version compatibility check
-        if pt_file.header.format_version > 1 {
-            return Err(PtFormatError::UnsupportedVersion(format!(
-                "Format version {} not supported", pt_file.header.format_version
-            )));
-        }
+        // Validate loaded data
+        Self::validate_loaded_data(&pt_file)?;
         
         let tree = if let Some(geometry) = pt_file.geometry_data {
-            Self::convert_geometry_to_tree(geometry, &pt_file.wind_data, &pt_file.metadata)
+            let converted_tree = Self::convert_geometry_to_tree(geometry, &pt_file.wind_data, &pt_file.metadata);
+            Self::validate_tree(&converted_tree)?;
+            converted_tree
         } else {
             // Regenerate from procedural parameters
+            Self::validate_params(&pt_file.procedural_params)?;
             let mut generator = TreeGenerator::new(pt_file.procedural_params.seed);
-            generator.generate(&pt_file.procedural_params)
+            let generated_tree = generator.generate(&pt_file.procedural_params);
+            Self::validate_tree(&generated_tree)?;
+            generated_tree
         };
         
         Ok((tree, pt_file.procedural_params))
@@ -1400,7 +1488,7 @@ impl PtFileManager {
         }
     }
     
-    fn extract_materials(tree: &PixelTree) -> PtMaterialData {
+    fn extract_materials(_tree: &PixelTree) -> PtMaterialData {
         PtMaterialData {
             trunk_materials: vec![PtMaterial {
                 name: "Trunk".to_string(),
@@ -1514,6 +1602,1285 @@ impl PtFileManager {
             estimated_age_years: Some(25.0),
             biome: Some("Temperate".to_string()),
             custom_properties: HashMap::new(),
+        }
+    }
+
+    // ============================================================================
+    // VALIDATION FUNCTIONS
+    // ============================================================================
+
+    fn validate_path<P: AsRef<Path>>(path: P) -> Result<(), PtFormatError> {
+        let path = path.as_ref();
+        
+        // Check for path traversal attacks
+        if path.to_string_lossy().contains("..") {
+            return Err(PtFormatError::InvalidPath(
+                "Path traversal not allowed".to_string()
+            ));
+        }
+        
+        // Check for absolute paths in untrusted contexts
+        if path.is_absolute() {
+            let path_str = path.to_string_lossy();
+            if path_str.starts_with("/dev/") || path_str.starts_with("/proc/") || path_str.starts_with("/sys/") {
+                return Err(PtFormatError::InvalidPath(
+                    "System directory access not allowed".to_string()
+                ));
+            }
+        }
+        
+        // Validate extension
+        if let Some(ext) = path.extension() {
+            if ext != "pt" && ext != "json" {
+                return Err(PtFormatError::InvalidPath(
+                    format!("Invalid file extension: {}", ext.to_string_lossy())
+                ));
+            }
+        } else {
+            return Err(PtFormatError::InvalidPath(
+                "Missing file extension".to_string()
+            ));
+        }
+        
+        Ok(())
+    }
+
+    fn validate_tree(tree: &PixelTree) -> Result<(), PtFormatError> {
+        // Validate trunk
+        if tree.trunk.segments.len() > MAX_TRUNK_SEGMENTS {
+            return Err(PtFormatError::InvalidTreeData(
+                format!("Too many trunk segments: {}", tree.trunk.segments.len())
+            ));
+        }
+        
+        if tree.trunk.height < 0.0 || tree.trunk.height > 1000.0 {
+            return Err(PtFormatError::InvalidTreeData(
+                format!("Invalid trunk height: {}", tree.trunk.height)
+            ));
+        }
+        
+        if tree.trunk.base_width < 0.0 || tree.trunk.base_width > 100.0 {
+            return Err(PtFormatError::InvalidTreeData(
+                format!("Invalid trunk width: {}", tree.trunk.base_width)
+            ));
+        }
+
+        // Validate branches
+        if tree.branches.len() > MAX_BRANCHES {
+            return Err(PtFormatError::InvalidTreeData(
+                format!("Too many branches: {}", tree.branches.len())
+            ));
+        }
+
+        for (i, branch) in tree.branches.iter().enumerate() {
+            if branch.thickness < 0.0 || branch.thickness > 50.0 {
+                return Err(PtFormatError::InvalidTreeData(
+                    format!("Invalid branch thickness at index {}: {}", i, branch.thickness)
+                ));
+            }
+            
+            if branch.generation > 10 {
+                return Err(PtFormatError::InvalidTreeData(
+                    format!("Invalid branch generation at index {}: {}", i, branch.generation)
+                ));
+            }
+
+            // Validate positions are reasonable
+            let start_mag = branch.start.length();
+            let end_mag = branch.end.length();
+            if start_mag > 2000.0 || end_mag > 2000.0 {
+                return Err(PtFormatError::InvalidTreeData(
+                    format!("Branch position too far from origin at index {}", i)
+                ));
+            }
+        }
+
+        // Validate leaves
+        if tree.leaves.leaves.len() > MAX_LEAVES {
+            return Err(PtFormatError::InvalidTreeData(
+                format!("Too many leaves: {}", tree.leaves.leaves.len())
+            ));
+        }
+
+        for (i, leaf) in tree.leaves.leaves.iter().enumerate() {
+            if leaf.scale < 0.0 || leaf.scale > 10.0 {
+                return Err(PtFormatError::InvalidTreeData(
+                    format!("Invalid leaf scale at index {}: {}", i, leaf.scale)
+                ));
+            }
+
+            let pos_mag = leaf.pos.length();
+            if pos_mag > 2000.0 {
+                return Err(PtFormatError::InvalidTreeData(
+                    format!("Leaf position too far from origin at index {}", i)
+                ));
+            }
+        }
+
+        // Validate wind parameters
+        if tree.wind_params.strength < 0.0 || tree.wind_params.strength > 100.0 {
+            return Err(PtFormatError::InvalidTreeData(
+                format!("Invalid wind strength: {}", tree.wind_params.strength)
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_params(params: &GenerationParams) -> Result<(), PtFormatError> {
+        if params.height_range.0 < 0.0 || params.height_range.1 < params.height_range.0 || params.height_range.1 > 2000.0 {
+            return Err(PtFormatError::InvalidTreeData(
+                format!("Invalid height range: {:?}", params.height_range)
+            ));
+        }
+
+        if params.trunk_width_range.0 < 0.0 || params.trunk_width_range.1 < params.trunk_width_range.0 || params.trunk_width_range.1 > 200.0 {
+            return Err(PtFormatError::InvalidTreeData(
+                format!("Invalid trunk width range: {:?}", params.trunk_width_range)
+            ));
+        }
+
+        if params.branch_angle_variance < 0.0 || params.branch_angle_variance > 360.0 {
+            return Err(PtFormatError::InvalidTreeData(
+                format!("Invalid branch angle variance: {}", params.branch_angle_variance)
+            ));
+        }
+
+        if params.leaf_density < 0.0 || params.leaf_density > 100.0 {
+            return Err(PtFormatError::InvalidTreeData(
+                format!("Invalid leaf density: {}", params.leaf_density)
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_and_sanitize_metadata(metadata: &mut PtMetadata) -> Result<(), PtFormatError> {
+        // Sanitize string lengths
+        if metadata.tree_name.len() > MAX_TREE_NAME_LEN {
+            metadata.tree_name.truncate(MAX_TREE_NAME_LEN);
+        }
+
+        if metadata.author.len() > MAX_AUTHOR_LEN {
+            metadata.author.truncate(MAX_AUTHOR_LEN);
+        }
+
+        if metadata.description.len() > MAX_DESCRIPTION_LEN {
+            metadata.description.truncate(MAX_DESCRIPTION_LEN);
+        }
+
+        // Validate and limit custom properties
+        if metadata.custom_properties.len() > MAX_CUSTOM_PROPERTIES {
+            return Err(PtFormatError::InvalidTreeData(
+                format!("Too many custom properties: {}", metadata.custom_properties.len())
+            ));
+        }
+
+        let mut sanitized_props = HashMap::new();
+        for (key, value) in &metadata.custom_properties {
+            if key.len() > MAX_PROPERTY_KEY_LEN || value.len() > MAX_PROPERTY_VALUE_LEN {
+                continue; // Skip oversized properties
+            }
+            
+            // Sanitize key/value (remove control characters)
+            let clean_key: String = key.chars().filter(|c| !c.is_control()).collect();
+            let clean_value: String = value.chars().filter(|c| !c.is_control()).collect();
+            
+            if !clean_key.is_empty() && !clean_value.is_empty() {
+                sanitized_props.insert(clean_key, clean_value);
+            }
+        }
+        metadata.custom_properties = sanitized_props;
+
+        // Validate age if present
+        if let Some(age) = metadata.estimated_age_years {
+            if age < 0.0 || age > 10000.0 {
+                return Err(PtFormatError::InvalidTreeData(
+                    format!("Invalid tree age: {}", age)
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_file_header(header: &PtFileHeader) -> Result<(), PtFormatError> {
+        if header.magic != "PIXELTREE" {
+            return Err(PtFormatError::InvalidHeader(format!(
+                "Expected 'PIXELTREE', got '{}'", header.magic
+            )));
+        }
+
+        if header.format_version == 0 || header.format_version > 10 {
+            return Err(PtFormatError::UnsupportedVersion(format!(
+                "Invalid format version: {}", header.format_version
+            )));
+        }
+
+        if header.format_version > 1 {
+            return Err(PtFormatError::UnsupportedVersion(format!(
+                "Format version {} not supported, maximum supported is 1", header.format_version
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn validate_loaded_data(pt_file: &PixelTreeFile) -> Result<(), PtFormatError> {
+        // Validate metadata
+        if pt_file.metadata.tree_name.is_empty() {
+            return Err(PtFormatError::DataCorruption("Empty tree name".to_string()));
+        }
+
+        // Validate geometry data if present
+        if let Some(ref geometry) = pt_file.geometry_data {
+            if geometry.trunk_segments.len() > MAX_TRUNK_SEGMENTS {
+                return Err(PtFormatError::DataCorruption(
+                    format!("Too many trunk segments in file: {}", geometry.trunk_segments.len())
+                ));
+            }
+
+            if geometry.branches.len() > MAX_BRANCHES {
+                return Err(PtFormatError::DataCorruption(
+                    format!("Too many branches in file: {}", geometry.branches.len())
+                ));
+            }
+
+            if geometry.leaves.len() > MAX_LEAVES {
+                return Err(PtFormatError::DataCorruption(
+                    format!("Too many leaves in file: {}", geometry.leaves.len())
+                ));
+            }
+        }
+
+        // Validate LOD levels
+        if pt_file.lod_levels.is_empty() || pt_file.lod_levels.len() > 10 {
+            return Err(PtFormatError::DataCorruption(
+                format!("Invalid number of LOD levels: {}", pt_file.lod_levels.len())
+            ));
+        }
+
+        for (i, lod) in pt_file.lod_levels.iter().enumerate() {
+            if lod.max_distance < 0.0 {
+                return Err(PtFormatError::DataCorruption(
+                    format!("Invalid LOD distance at level {}: {}", i, lod.max_distance)
+                ));
+            }
+            
+            if lod.leaf_density < 0.0 || lod.leaf_density > 10.0 {
+                return Err(PtFormatError::DataCorruption(
+                    format!("Invalid LOD leaf density at level {}: {}", i, lod.leaf_density)
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// PIXELTREE FOREST FORMAT (.ptf)
+// ============================================================================
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PtfForestFile {
+    pub header: PtfFileHeader,
+    pub forest_metadata: PtfForestMetadata,
+    pub tree_groups: Vec<PtfTreeGroup>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PtfFileHeader {
+    pub format_version: String, // "PixelTree Forest v1.0"
+    pub magic: String, // "PTFOREST"
+    pub encoding: PtfEncoding,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum PtfEncoding {
+    Text, // Human-readable text format (like STF)
+    Binary, // Compact binary format
+    Json, // JSON format for tooling
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PtfForestMetadata {
+    pub forest_name: String,
+    pub author: String,
+    pub created_date: DateTime<Utc>,
+    pub modified_date: DateTime<Utc>,
+    pub biome: String, // "Old Growth Forest", "Pine Grove", etc.
+    pub season: PtfSeason,
+    pub time_of_day: Option<PtfTimeOfDay>,
+    pub global_wind: WindParams,
+    pub terrain: Option<PtfTerrain>,
+    pub lighting: Option<PtfLighting>,
+    pub weather: Option<PtfWeather>,
+    pub total_trees: usize,
+    pub bounding_box: PtBoundingBox,
+    pub tags: Vec<String>,
+    pub custom_properties: HashMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum PtfSeason {
+    Spring,
+    Summer,
+    Autumn,
+    Winter,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PtfTimeOfDay {
+    pub hour: f32, // 0.0-23.99
+    pub ambient_light: f32, // 0.0-1.0
+    pub sun_angle: f32, // degrees
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PtfTerrain {
+    pub elevation_min: f32,
+    pub elevation_max: f32,
+    pub slope_factor: f32, // 0.0-1.0
+    pub soil_quality_base: f32, // 0.0-1.0
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PtfLighting {
+    pub ambient_color: [f32; 3], // RGB
+    pub sun_color: [f32; 3], // RGB
+    pub shadow_intensity: f32, // 0.0-1.0
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PtfWeather {
+    pub condition: PtfWeatherCondition,
+    pub intensity: f32, // 0.0-1.0
+    pub wind_modifier: f32, // Multiplier for global wind
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum PtfWeatherCondition {
+    Clear,
+    Cloudy,
+    Rainy,
+    Stormy,
+    Foggy,
+    Snowy,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PtfTreeGroup {
+    pub tree_file: String, // Path to .pt file
+    pub instances: Vec<PtfTreeInstance>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PtfTreeInstance {
+    pub position: Vec3,
+    pub rotation: f32,
+    pub scale: f32,
+    pub health_factor: f32, // 0.0-1.0, affects appearance
+    pub tags: Vec<String>, // ["healthy", "mature", "diseased", etc.]
+    pub custom_properties: HashMap<String, String>,
+}
+
+#[derive(Error, Debug)]
+pub enum PtfFormatError {
+    #[error("Invalid PTF header: {0}")]
+    InvalidHeader(String),
+    #[error("Unsupported PTF version: {0}")]
+    UnsupportedVersion(String),
+    #[error("PTF parsing error: {0}")]
+    ParseError(String),
+    #[error("Tree file not found: {0}")]
+    TreeFileNotFound(String),
+    #[error("Invalid tree instance data: {0}")]
+    InvalidInstanceData(String),
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+}
+
+// ============================================================================
+// PTF FORMAT IMPLEMENTATION
+// ============================================================================
+
+pub struct PtfForestManager;
+
+impl PtfForestManager {
+    pub fn save_forest<P: AsRef<Path>>(
+        forest_metadata: &PtfForestMetadata,
+        tree_groups: &[(String, Vec<PtfTreeInstance>)],
+        path: P,
+        encoding: PtfEncoding,
+    ) -> Result<(), PtfFormatError> {
+        // Validate input parameters
+        Self::validate_forest_for_save(forest_metadata, tree_groups)?;
+        Self::validate_ptf_path(path.as_ref())?;
+
+        let tree_groups: Vec<PtfTreeGroup> = tree_groups
+            .iter()
+            .map(|(tree_file, instances)| PtfTreeGroup {
+                tree_file: tree_file.clone(),
+                instances: instances.clone(),
+            })
+            .collect();
+
+        let ptf_forest = PtfForestFile {
+            header: PtfFileHeader {
+                format_version: "PixelTree Forest v1.0".to_string(),
+                magic: "PTFOREST".to_string(),
+                encoding: encoding.clone(),
+            },
+            forest_metadata: forest_metadata.clone(),
+            tree_groups,
+        };
+
+        let content = match encoding {
+            PtfEncoding::Text => Self::serialize_to_text(&ptf_forest)?,
+            PtfEncoding::Binary => bincode::serialize(&ptf_forest)
+                .map_err(|e| PtfFormatError::SerializationError(e.to_string()))?,
+            PtfEncoding::Json => serde_json::to_vec_pretty(&ptf_forest)
+                .map_err(|e| PtfFormatError::SerializationError(e.to_string()))?,
+        };
+
+        // Validate serialized size
+        if content.len() as u64 > MAX_PTF_FILE_SIZE {
+            return Err(PtfFormatError::SerializationError(
+                format!("Serialized PTF file size {} exceeds maximum {}", content.len(), MAX_PTF_FILE_SIZE)
+            ));
+        }
+
+        // Atomic write - write to temporary file first, then rename
+        let temp_path = path.as_ref().with_extension("ptf.tmp");
+        std::fs::write(&temp_path, &content).map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            PtfFormatError::IoError(e)
+        })?;
+        
+        // Atomic rename
+        std::fs::rename(&temp_path, path.as_ref()).map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            PtfFormatError::IoError(e)
+        })?;
+
+        Ok(())
+    }
+
+    pub fn load_forest<P: AsRef<Path>>(path: P) -> Result<PtfForestFile, PtfFormatError> {
+        // Security validation
+        Self::validate_ptf_path(path.as_ref())?;
+        
+        // Check file size before reading
+        let metadata = std::fs::metadata(path.as_ref())?;
+        let file_size = metadata.len();
+        
+        if file_size > MAX_PTF_FILE_SIZE {
+            return Err(PtfFormatError::SerializationError(
+                format!("PTF file size {} exceeds maximum {}", file_size, MAX_PTF_FILE_SIZE)
+            ));
+        }
+        
+        if file_size < MIN_PTF_FILE_SIZE {
+            return Err(PtfFormatError::SerializationError(
+                format!("PTF file size {} is below minimum {}", file_size, MIN_PTF_FILE_SIZE)
+            ));
+        }
+
+        let content = std::fs::read(path.as_ref())?;
+
+        // Verify content length matches file size
+        if content.len() as u64 != file_size {
+            return Err(PtfFormatError::SerializationError(
+                "File size mismatch - possible corruption".to_string()
+            ));
+        }
+
+        let ptf_forest = {
+            // Try to detect format by content
+            if let Ok(text) = std::str::from_utf8(&content) {
+                if text.starts_with("# PixelTree Forest") {
+                    Self::parse_text_format(text)?
+                } else if text.trim_start().starts_with('{') {
+                    serde_json::from_slice(&content)
+                        .map_err(|e| PtfFormatError::SerializationError(e.to_string()))?
+                } else {
+                    return Err(PtfFormatError::SerializationError(
+                        "Unrecognized text format".to_string()
+                    ));
+                }
+            } else {
+                // Try binary format
+                bincode::deserialize(&content)
+                    .map_err(|e| PtfFormatError::SerializationError(e.to_string()))?
+            }
+        };
+
+        // Validate loaded data
+        Self::validate_loaded_forest(&ptf_forest)?;
+        
+        Ok(ptf_forest)
+    }
+
+    pub fn spawn_forest_from_ptf<P: AsRef<Path>>(
+        commands: &mut Commands,
+        ptf_path: P,
+        spatial_index: &mut TreeSpatialIndex,
+    ) -> Result<Vec<Entity>, PtfFormatError> {
+        let base_path = ptf_path.as_ref().parent().unwrap_or(Path::new("."));
+        let ptf_forest = Self::load_forest(&ptf_path)?;
+        let mut entities = Vec::new();
+
+        for tree_group in &ptf_forest.tree_groups {
+            let tree_file_path = base_path.join(&tree_group.tree_file);
+            
+            // Load the base tree template
+            let (base_tree, _base_params) = PtFileManager::load_tree(&tree_file_path)
+                .map_err(|_| PtfFormatError::TreeFileNotFound(tree_group.tree_file.clone()))?;
+
+            for instance in &tree_group.instances {
+                // Clone and modify tree based on instance properties
+                let mut tree = base_tree.clone();
+                Self::apply_instance_modifications(&mut tree, instance, &ptf_forest.forest_metadata);
+
+                let entity = commands.spawn((
+                    Transform::from_translation(instance.position)
+                        .with_rotation(Quat::from_rotation_z(instance.rotation))
+                        .with_scale(Vec3::splat(instance.scale)),
+                    GlobalTransform::default(),
+                    tree,
+                    Visibility::default(),
+                    InheritedVisibility::default(),
+                    ViewVisibility::default(),
+                )).id();
+
+                spatial_index.insert(entity, instance.position.truncate());
+                entities.push(entity);
+            }
+        }
+
+        Ok(entities)
+    }
+
+    // ============================================================================
+    // PTF VALIDATION FUNCTIONS
+    // ============================================================================
+
+    fn validate_ptf_path(path: &Path) -> Result<(), PtfFormatError> {
+        // Check for path traversal attempts
+        let path_str = path.to_string_lossy();
+        if path_str.contains("..") || path_str.contains('\0') {
+            return Err(PtfFormatError::SerializationError(
+                "Invalid path: contains path traversal or null bytes".to_string()
+            ));
+        }
+
+        // Check path length
+        if path_str.len() > MAX_TREE_FILE_PATH_LENGTH {
+            return Err(PtfFormatError::SerializationError(
+                format!("Path too long: {} > {}", path_str.len(), MAX_TREE_FILE_PATH_LENGTH)
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_forest_for_save(
+        metadata: &PtfForestMetadata,
+        tree_groups: &[(String, Vec<PtfTreeInstance>)]
+    ) -> Result<(), PtfFormatError> {
+        // Validate metadata
+        Self::validate_forest_metadata(metadata)?;
+
+        // Validate tree groups structure
+        if tree_groups.len() > MAX_TREE_GROUPS {
+            return Err(PtfFormatError::SerializationError(
+                format!("Too many tree groups: {} > {}", tree_groups.len(), MAX_TREE_GROUPS)
+            ));
+        }
+
+        let mut total_instances = 0;
+        for (tree_file, instances) in tree_groups {
+            // Validate tree file path
+            if tree_file.len() > MAX_TREE_FILE_PATH_LENGTH {
+                return Err(PtfFormatError::SerializationError(
+                    format!("Tree file path too long: {}", tree_file.len())
+                ));
+            }
+
+            // Validate instances count
+            if instances.len() > MAX_INSTANCES_PER_GROUP {
+                return Err(PtfFormatError::SerializationError(
+                    format!("Too many instances in group: {} > {}", instances.len(), MAX_INSTANCES_PER_GROUP)
+                ));
+            }
+
+            total_instances += instances.len();
+            if total_instances > MAX_TREE_INSTANCES {
+                return Err(PtfFormatError::SerializationError(
+                    format!("Total instances exceed maximum: {} > {}", total_instances, MAX_TREE_INSTANCES)
+                ));
+            }
+
+            // Validate each instance
+            for instance in instances {
+                Self::validate_tree_instance(instance)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_forest_metadata(metadata: &PtfForestMetadata) -> Result<(), PtfFormatError> {
+        // Check string lengths
+        if metadata.forest_name.len() > MAX_TREE_NAME_LEN {
+            return Err(PtfFormatError::SerializationError(
+                format!("Forest name too long: {}", metadata.forest_name.len())
+            ));
+        }
+
+        if metadata.author.len() > MAX_AUTHOR_LEN {
+            return Err(PtfFormatError::SerializationError(
+                format!("Author name too long: {}", metadata.author.len())
+            ));
+        }
+
+        if metadata.biome.len() > MAX_DESCRIPTION_LEN {
+            return Err(PtfFormatError::SerializationError(
+                format!("Biome description too long: {}", metadata.biome.len())
+            ));
+        }
+
+        // Validate tags count
+        if metadata.tags.len() > MAX_PTF_TAGS {
+            return Err(PtfFormatError::SerializationError(
+                format!("Too many tags: {} > {}", metadata.tags.len(), MAX_PTF_TAGS)
+            ));
+        }
+
+        // Validate custom properties count
+        if metadata.custom_properties.len() > MAX_PTF_CUSTOM_PROPERTIES {
+            return Err(PtfFormatError::SerializationError(
+                format!("Too many custom properties: {} > {}", metadata.custom_properties.len(), MAX_PTF_CUSTOM_PROPERTIES)
+            ));
+        }
+
+        // Validate custom property keys and values
+        for (key, value) in &metadata.custom_properties {
+            if key.len() > MAX_PROPERTY_KEY_LEN {
+                return Err(PtfFormatError::SerializationError(
+                    format!("Property key too long: {} > {}", key.len(), MAX_PROPERTY_KEY_LEN)
+                ));
+            }
+            if value.len() > MAX_PROPERTY_VALUE_LEN {
+                return Err(PtfFormatError::SerializationError(
+                    format!("Property value too long: {} > {}", value.len(), MAX_PROPERTY_VALUE_LEN)
+                ));
+            }
+        }
+
+        // Validate bounding box
+        if metadata.bounding_box.min[0] > metadata.bounding_box.max[0] ||
+           metadata.bounding_box.min[1] > metadata.bounding_box.max[1] {
+            return Err(PtfFormatError::SerializationError(
+                "Invalid bounding box: min > max".to_string()
+            ));
+        }
+
+        if metadata.bounding_box.height <= 0.0 || metadata.bounding_box.height > 10000.0 {
+            return Err(PtfFormatError::SerializationError(
+                format!("Invalid bounding box height: {}", metadata.bounding_box.height)
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_tree_instance(instance: &PtfTreeInstance) -> Result<(), PtfFormatError> {
+        // Validate scale bounds
+        if instance.scale <= 0.0 || instance.scale > 100.0 {
+            return Err(PtfFormatError::SerializationError(
+                format!("Invalid tree scale: {}", instance.scale)
+            ));
+        }
+
+        // Validate health factor
+        if instance.health_factor < 0.0 || instance.health_factor > 1.0 {
+            return Err(PtfFormatError::SerializationError(
+                format!("Invalid health factor: {}", instance.health_factor)
+            ));
+        }
+
+        // Validate position bounds (prevent extreme values)
+        let pos_limit = 1000000.0;
+        if instance.position.x.abs() > pos_limit || 
+           instance.position.y.abs() > pos_limit ||
+           instance.position.z.abs() > pos_limit {
+            return Err(PtfFormatError::SerializationError(
+                "Tree position exceeds reasonable bounds".to_string()
+            ));
+        }
+
+        // Validate tags
+        if instance.tags.len() > MAX_PTF_TAGS {
+            return Err(PtfFormatError::SerializationError(
+                format!("Too many instance tags: {} > {}", instance.tags.len(), MAX_PTF_TAGS)
+            ));
+        }
+
+        // Validate custom properties
+        if instance.custom_properties.len() > MAX_CUSTOM_PROPERTIES {
+            return Err(PtfFormatError::SerializationError(
+                format!("Too many instance properties: {} > {}", instance.custom_properties.len(), MAX_CUSTOM_PROPERTIES)
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_loaded_forest(forest: &PtfForestFile) -> Result<(), PtfFormatError> {
+        // Validate header
+        if forest.header.magic != "PTFOREST" {
+            return Err(PtfFormatError::SerializationError(
+                "Invalid magic header".to_string()
+            ));
+        }
+
+        // Validate metadata
+        Self::validate_forest_metadata(&forest.forest_metadata)?;
+
+        // Validate tree groups
+        if forest.tree_groups.len() > MAX_TREE_GROUPS {
+            return Err(PtfFormatError::SerializationError(
+                format!("Too many tree groups: {} > {}", forest.tree_groups.len(), MAX_TREE_GROUPS)
+            ));
+        }
+
+        let mut total_instances = 0;
+        for group in &forest.tree_groups {
+            if group.instances.len() > MAX_INSTANCES_PER_GROUP {
+                return Err(PtfFormatError::SerializationError(
+                    format!("Too many instances in group: {} > {}", group.instances.len(), MAX_INSTANCES_PER_GROUP)
+                ));
+            }
+
+            total_instances += group.instances.len();
+            if total_instances > MAX_TREE_INSTANCES {
+                return Err(PtfFormatError::SerializationError(
+                    format!("Total instances exceed maximum: {} > {}", total_instances, MAX_TREE_INSTANCES)
+                ));
+            }
+
+            for instance in &group.instances {
+                Self::validate_tree_instance(instance)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn serialize_to_text(forest: &PtfForestFile) -> Result<Vec<u8>, PtfFormatError> {
+        let mut content = String::new();
+        
+        // Header comments
+        content.push_str(&format!("# PixelTree Forest v1.0\n"));
+        content.push_str(&format!("# Forest: {}\n", forest.forest_metadata.forest_name));
+        content.push_str(&format!("# Author: {}\n", forest.forest_metadata.author));
+        content.push_str(&format!("# Created: {}\n", forest.forest_metadata.created_date.format("%Y-%m-%dT%H:%M:%SZ")));
+        content.push_str(&format!("# Biome: {}\n", forest.forest_metadata.biome));
+        content.push_str(&format!("# Season: {:?}\n", forest.forest_metadata.season));
+        content.push_str(&format!("# Wind: Global(strength={:.1}, direction=[{:.1},{:.1}])\n", 
+            forest.forest_metadata.global_wind.strength,
+            forest.forest_metadata.global_wind.direction.x,
+            forest.forest_metadata.global_wind.direction.y));
+        
+        if let Some(time) = &forest.forest_metadata.time_of_day {
+            content.push_str(&format!("# Lighting: TimeOfDay(hour={:.1}, ambient={:.1})\n", 
+                time.hour, time.ambient_light));
+        }
+        
+        if let Some(terrain) = &forest.forest_metadata.terrain {
+            content.push_str(&format!("# Terrain: Elevation(min={:.1}, max={:.1}, slope={:.1})\n",
+                terrain.elevation_min, terrain.elevation_max, terrain.slope_factor));
+        }
+        
+        content.push_str("\n");
+
+        // Tree groups
+        for tree_group in &forest.tree_groups {
+            content.push_str(&format!("{}\n", tree_group.tree_file));
+            content.push_str(&format!("{}\n", tree_group.instances.len()));
+            
+            for instance in &tree_group.instances {
+                content.push_str(&format!(
+                    "{:.1} {:.1} {:.1} {:.6} {:.2} {:.2}",
+                    instance.position.x, instance.position.y, instance.position.z,
+                    instance.rotation, instance.scale, instance.health_factor
+                ));
+                
+                if !instance.tags.is_empty() {
+                    content.push_str(&format!(" [{}]", instance.tags.join(",")));
+                }
+                
+                if !instance.custom_properties.is_empty() {
+                    let props: Vec<String> = instance.custom_properties
+                        .iter()
+                        .map(|(k, v)| format!("{}:{}", k, v))
+                        .collect();
+                    content.push_str(&format!(" {{{}}}", props.join(",")));
+                }
+                
+                content.push_str("\n");
+            }
+            content.push_str("\n");
+        }
+
+        Ok(content.into_bytes())
+    }
+
+    fn parse_text_format(content: &str) -> Result<PtfForestFile, PtfFormatError> {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut line_idx = 0;
+        
+        // Parse header comments
+        let mut forest_name = "Unnamed Forest".to_string();
+        let mut author = "Unknown".to_string();
+        let created_date = Utc::now();
+        let mut biome = "Temperate".to_string();
+        let mut season = PtfSeason::Summer;
+        let global_wind = WindParams::default();
+        let time_of_day = None;
+        let terrain = None;
+        
+        while line_idx < lines.len() && lines[line_idx].starts_with('#') {
+            let line = lines[line_idx].trim_start_matches('#').trim();
+            
+            if let Some(name) = line.strip_prefix("Forest: ") {
+                forest_name = name.to_string();
+            } else if let Some(auth) = line.strip_prefix("Author: ") {
+                author = auth.to_string();
+            } else if let Some(biome_str) = line.strip_prefix("Biome: ") {
+                biome = biome_str.to_string();
+            } else if let Some(season_str) = line.strip_prefix("Season: ") {
+                season = match season_str {
+                    "Spring" => PtfSeason::Spring,
+                    "Summer" => PtfSeason::Summer,
+                    "Autumn" => PtfSeason::Autumn,
+                    "Winter" => PtfSeason::Winter,
+                    _ => PtfSeason::Summer,
+                };
+            }
+            line_idx += 1;
+        }
+
+        // Skip empty lines
+        while line_idx < lines.len() && lines[line_idx].trim().is_empty() {
+            line_idx += 1;
+        }
+
+        let mut tree_groups = Vec::new();
+        let mut total_trees = 0;
+
+        // Parse tree groups
+        while line_idx < lines.len() {
+            if lines[line_idx].trim().is_empty() {
+                line_idx += 1;
+                continue;
+            }
+
+            let tree_file = lines[line_idx].trim().to_string();
+            line_idx += 1;
+
+            if line_idx >= lines.len() {
+                break;
+            }
+
+            let instance_count: usize = lines[line_idx].trim().parse()
+                .map_err(|_| PtfFormatError::ParseError(format!("Invalid instance count: {}", lines[line_idx])))?;
+            line_idx += 1;
+            total_trees += instance_count;
+
+            let mut instances = Vec::with_capacity(instance_count);
+
+            for _ in 0..instance_count {
+                if line_idx >= lines.len() {
+                    return Err(PtfFormatError::ParseError("Unexpected end of file".to_string()));
+                }
+
+                let instance = Self::parse_instance_line(lines[line_idx])?;
+                instances.push(instance);
+                line_idx += 1;
+            }
+
+            tree_groups.push(PtfTreeGroup {
+                tree_file,
+                instances,
+            });
+        }
+
+        let forest_metadata = PtfForestMetadata {
+            forest_name,
+            author,
+            created_date,
+            modified_date: Utc::now(),
+            biome,
+            season,
+            time_of_day,
+            global_wind,
+            terrain,
+            lighting: None,
+            weather: None,
+            total_trees,
+            bounding_box: PtBoundingBox {
+                min: [-1000.0, -1000.0],
+                max: [1000.0, 1000.0],
+                height: 200.0,
+            },
+            tags: Vec::new(),
+            custom_properties: HashMap::new(),
+        };
+
+        Ok(PtfForestFile {
+            header: PtfFileHeader {
+                format_version: "PixelTree Forest v1.0".to_string(),
+                magic: "PTFOREST".to_string(),
+                encoding: PtfEncoding::Text,
+            },
+            forest_metadata,
+            tree_groups,
+        })
+    }
+
+    fn parse_instance_line(line: &str) -> Result<PtfTreeInstance, PtfFormatError> {
+        let line = line.trim();
+        
+        // Split into main parts and optional parts
+        let (coords_part, rest) = if let Some(bracket_pos) = line.find('[') {
+            line.split_at(bracket_pos)
+        } else if let Some(brace_pos) = line.find('{') {
+            line.split_at(brace_pos)
+        } else {
+            (line, "")
+        };
+
+        // Parse coordinates: x y z rotation scale health_factor
+        let coords: Vec<&str> = coords_part.trim().split_whitespace().collect();
+        if coords.len() < 5 {
+            return Err(PtfFormatError::InvalidInstanceData(
+                format!("Expected at least 5 coordinates, got {}", coords.len())
+            ));
+        }
+
+        let x = coords[0].parse::<f32>()
+            .map_err(|_| PtfFormatError::InvalidInstanceData(format!("Invalid x: {}", coords[0])))?;
+        let y = coords[1].parse::<f32>()
+            .map_err(|_| PtfFormatError::InvalidInstanceData(format!("Invalid y: {}", coords[1])))?;
+        let z = coords[2].parse::<f32>()
+            .map_err(|_| PtfFormatError::InvalidInstanceData(format!("Invalid z: {}", coords[2])))?;
+        let rotation = coords[3].parse::<f32>()
+            .map_err(|_| PtfFormatError::InvalidInstanceData(format!("Invalid rotation: {}", coords[3])))?;
+        let scale = coords[4].parse::<f32>()
+            .map_err(|_| PtfFormatError::InvalidInstanceData(format!("Invalid scale: {}", coords[4])))?;
+        
+        let health_factor = if coords.len() > 5 {
+            coords[5].parse::<f32>()
+                .map_err(|_| PtfFormatError::InvalidInstanceData(format!("Invalid health_factor: {}", coords[5])))?
+        } else {
+            1.0
+        };
+
+        // Parse tags [tag1,tag2,tag3]
+        let mut tags = Vec::new();
+        if let Some(start) = rest.find('[') {
+            if let Some(end) = rest[start..].find(']') {
+                let tags_str = &rest[start+1..start+end];
+                tags = tags_str.split(',').map(|s| s.trim().to_string()).collect();
+            }
+        }
+
+        // Parse custom properties {key1:value1,key2:value2}
+        let mut custom_properties = HashMap::new();
+        if let Some(start) = rest.find('{') {
+            if let Some(end) = rest[start..].find('}') {
+                let props_str = &rest[start+1..start+end];
+                for prop in props_str.split(',') {
+                    if let Some((key, value)) = prop.split_once(':') {
+                        custom_properties.insert(key.trim().to_string(), value.trim().to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(PtfTreeInstance {
+            position: Vec3::new(x, y, z),
+            rotation,
+            scale,
+            health_factor,
+            tags,
+            custom_properties,
+        })
+    }
+
+    fn apply_instance_modifications(
+        tree: &mut PixelTree,
+        instance: &PtfTreeInstance,
+        forest_metadata: &PtfForestMetadata,
+    ) {
+        // Apply health factor to leaf density and color
+        if instance.health_factor < 1.0 {
+            let health_reduction = 1.0 - instance.health_factor;
+            
+            // Reduce leaf count based on health
+            let target_leaf_count = (tree.leaves.leaves.len() as f32 * instance.health_factor) as usize;
+            tree.leaves.leaves.truncate(target_leaf_count);
+            
+            // Modify leaf colors for diseased/unhealthy trees
+            for leaf in &mut tree.leaves.leaves {
+                if health_reduction > 0.3 {
+                    // Brown/yellow diseased leaves
+                    leaf.color[0] = (leaf.color[0] as f32 * 0.6 + 139.0 * 0.4) as u8; // More brown
+                    leaf.color[1] = (leaf.color[1] as f32 * 0.8 + 69.0 * 0.2) as u8;  // Less green
+                    leaf.color[2] = (leaf.color[2] as f32 * 0.4 + 19.0 * 0.6) as u8;  // Less blue
+                }
+            }
+        }
+
+        // Apply seasonal modifications
+        match forest_metadata.season {
+            PtfSeason::Autumn => {
+                for leaf in &mut tree.leaves.leaves {
+                    // Autumn colors - reds, oranges, yellows
+                    match leaf.leaf_type % 3 {
+                        0 => { leaf.color = [255, 69, 0]; }   // Orange red
+                        1 => { leaf.color = [255, 215, 0]; }  // Gold
+                        2 => { leaf.color = [205, 92, 92]; }  // Indian red
+                        _ => {}
+                    }
+                }
+            },
+            PtfSeason::Winter => {
+                // Remove most leaves for winter (keep only 10%)
+                let winter_leaf_count = (tree.leaves.leaves.len() / 10).max(1);
+                tree.leaves.leaves.truncate(winter_leaf_count);
+            },
+            PtfSeason::Spring => {
+                // Brighter, lighter greens
+                for leaf in &mut tree.leaves.leaves {
+                    leaf.color = [144, 238, 144]; // Light green
+                }
+            },
+            PtfSeason::Summer => {
+                // Default rich greens - no modification needed
+            }
+        }
+
+        // Apply custom property modifications
+        if let Some(age_str) = instance.custom_properties.get("age_years") {
+            if let Ok(age) = age_str.parse::<f32>() {
+                if age > 50.0 {
+                    // Ancient trees - more gnarled appearance
+                    tree.trunk.base_width *= 1.2;
+                } else if age < 15.0 {
+                    // Young trees - thinner trunk, fewer branches
+                    tree.trunk.base_width *= 0.7;
+                    let young_branch_count = (tree.branches.len() * 2 / 3).max(1);
+                    tree.branches.truncate(young_branch_count);
+                }
+            }
+        }
+
+        // Apply wind modifications
+        tree.wind_params = forest_metadata.global_wind.clone();
+        
+        // Modify wind response based on tags
+        if instance.tags.contains(&"ancient".to_string()) {
+            tree.wind_params.strength *= 0.7; // Ancient trees sway less
+        } else if instance.tags.contains(&"young".to_string()) {
+            tree.wind_params.strength *= 1.3; // Young trees sway more
+        }
+    }
+
+    pub fn create_sample_ptf() -> PtfForestFile {
+        PtfForestFile {
+            header: PtfFileHeader {
+                format_version: "PixelTree Forest v1.0".to_string(),
+                magic: "PTFOREST".to_string(),
+                encoding: PtfEncoding::Text,
+            },
+            forest_metadata: PtfForestMetadata {
+                forest_name: "Ancient Grove".to_string(),
+                author: "PixelTree Demo".to_string(),
+                created_date: Utc::now(),
+                modified_date: Utc::now(),
+                biome: "Old Growth Forest".to_string(),
+                season: PtfSeason::Summer,
+                time_of_day: Some(PtfTimeOfDay {
+                    hour: 14.0,
+                    ambient_light: 0.7,
+                    sun_angle: 45.0,
+                }),
+                global_wind: WindParams {
+                    strength: 2.0,
+                    frequency: 1.0,
+                    turbulence: 0.3,
+                    direction: Vec2::new(1.0, 0.3),
+                },
+                terrain: Some(PtfTerrain {
+                    elevation_min: 0.0,
+                    elevation_max: 50.0,
+                    slope_factor: 0.1,
+                    soil_quality_base: 0.8,
+                }),
+                lighting: Some(PtfLighting {
+                    ambient_color: [0.7, 0.7, 0.8],
+                    sun_color: [1.0, 0.9, 0.7],
+                    shadow_intensity: 0.6,
+                }),
+                weather: Some(PtfWeather {
+                    condition: PtfWeatherCondition::Clear,
+                    intensity: 0.0,
+                    wind_modifier: 1.0,
+                }),
+                total_trees: 8,
+                bounding_box: PtBoundingBox {
+                    min: [-150.0, -100.0],
+                    max: [150.0, 200.0],
+                    height: 180.0,
+                },
+                tags: vec!["demo".to_string(), "ancient_grove".to_string()],
+                custom_properties: {
+                    let mut props = HashMap::new();
+                    props.insert("biome_type".to_string(), "old_growth".to_string());
+                    props.insert("conservation_status".to_string(), "protected".to_string());
+                    props
+                },
+            },
+            tree_groups: vec![
+                PtfTreeGroup {
+                    tree_file: "sample_Oak_tree.pt".to_string(),
+                    instances: vec![
+                        PtfTreeInstance {
+                            position: Vec3::new(-100.0, 0.0, 0.0),
+                            rotation: 0.0,
+                            scale: 1.2,
+                            health_factor: 1.0,
+                            tags: vec!["healthy".to_string(), "mature".to_string()],
+                            custom_properties: {
+                                let mut props = HashMap::new();
+                                props.insert("age_years".to_string(), "45".to_string());
+                                props.insert("soil_quality".to_string(), "0.8".to_string());
+                                props
+                            },
+                        },
+                        PtfTreeInstance {
+                            position: Vec3::new(-50.0, 0.0, 0.0),
+                            rotation: 0.523599,
+                            scale: 0.9,
+                            health_factor: 0.8,
+                            tags: vec!["healthy".to_string()],
+                            custom_properties: {
+                                let mut props = HashMap::new();
+                                props.insert("age_years".to_string(), "30".to_string());
+                                props.insert("soil_quality".to_string(), "0.6".to_string());
+                                props
+                            },
+                        },
+                        PtfTreeInstance {
+                            position: Vec3::new(0.0, 80.0, 0.0),
+                            rotation: 0.0,
+                            scale: 1.3,
+                            health_factor: 1.0,
+                            tags: vec!["ancient".to_string(), "patriarch".to_string()],
+                            custom_properties: {
+                                let mut props = HashMap::new();
+                                props.insert("age_years".to_string(), "100".to_string());
+                                props.insert("soil_quality".to_string(), "1.0".to_string());
+                                props.insert("landmark".to_string(), "true".to_string());
+                                props
+                            },
+                        },
+                    ],
+                },
+                PtfTreeGroup {
+                    tree_file: "sample_Pine_tree.pt".to_string(),
+                    instances: vec![
+                        PtfTreeInstance {
+                            position: Vec3::new(-80.0, 120.0, 0.0),
+                            rotation: 0.785398,
+                            scale: 0.8,
+                            health_factor: 0.7,
+                            tags: vec!["young".to_string()],
+                            custom_properties: {
+                                let mut props = HashMap::new();
+                                props.insert("age_years".to_string(), "15".to_string());
+                                props.insert("elevation".to_string(), "20.0".to_string());
+                                props
+                            },
+                        },
+                        PtfTreeInstance {
+                            position: Vec3::new(80.0, 120.0, 0.0),
+                            rotation: -0.785398,
+                            scale: 0.7,
+                            health_factor: 0.6,
+                            tags: vec!["stunted".to_string(), "rocky_soil".to_string()],
+                            custom_properties: {
+                                let mut props = HashMap::new();
+                                props.insert("age_years".to_string(), "25".to_string());
+                                props.insert("elevation".to_string(), "25.0".to_string());
+                                props.insert("soil_type".to_string(), "rocky".to_string());
+                                props
+                            },
+                        },
+                    ],
+                },
+                PtfTreeGroup {
+                    tree_file: "sample_Willow_tree.pt".to_string(),
+                    instances: vec![
+                        PtfTreeInstance {
+                            position: Vec3::new(-120.0, -60.0, 0.0),
+                            rotation: 1.570796,
+                            scale: 1.1,
+                            health_factor: 0.9,
+                            tags: vec!["healthy".to_string(), "water_access".to_string()],
+                            custom_properties: {
+                                let mut props = HashMap::new();
+                                props.insert("age_years".to_string(), "35".to_string());
+                                props.insert("water_distance".to_string(), "5.0".to_string());
+                                props
+                            },
+                        },
+                        PtfTreeInstance {
+                            position: Vec3::new(120.0, -60.0, 0.0),
+                            rotation: -1.570796,
+                            scale: 1.0,
+                            health_factor: 1.0,
+                            tags: vec!["healthy".to_string(), "specimen".to_string()],
+                            custom_properties: {
+                                let mut props = HashMap::new();
+                                props.insert("age_years".to_string(), "40".to_string());
+                                props.insert("water_distance".to_string(), "10.0".to_string());
+                                props
+                            },
+                        },
+                        PtfTreeInstance {
+                            position: Vec3::new(0.0, 150.0, 0.0),
+                            rotation: 0.0,
+                            scale: 1.5,
+                            health_factor: 1.0,
+                            tags: vec!["healthy".to_string(), "crown_jewel".to_string()],
+                            custom_properties: {
+                                let mut props = HashMap::new();
+                                props.insert("age_years".to_string(), "60".to_string());
+                                props.insert("water_distance".to_string(), "2.0".to_string());
+                                props.insert("showcase".to_string(), "true".to_string());
+                                props
+                            },
+                        },
+                    ],
+                },
+            ],
         }
     }
 }
@@ -2066,6 +3433,579 @@ pine_tree.srt
                 Err(e) => println!("Failed to create {}: {}", filename, e),
             }
         }
+    }
+
+    #[test]
+    fn test_ptf_text_parsing() {
+        let ptf_content = r#"# PixelTree Forest v1.0
+# Forest: Test Grove
+# Author: Test Author
+# Biome: Test Forest
+# Season: Autumn
+
+sample_Oak_tree.pt
+2
+-100.0 0.0 0.0 0.0 1.2 1.0 [healthy,mature] {age_years:45,soil_quality:0.8}
+50.0 0.0 0.0 0.523599 0.9 0.8 [healthy] {age_years:30}
+
+sample_Pine_tree.pt
+1
+0.0 150.0 0.0 0.0 1.5 1.0 [ancient] {age_years:100}
+"#;
+
+        let ptf_forest = PtfForestManager::parse_text_format(ptf_content).unwrap();
+        
+        assert_eq!(ptf_forest.forest_metadata.forest_name, "Test Grove");
+        assert_eq!(ptf_forest.forest_metadata.author, "Test Author");
+        assert_eq!(ptf_forest.forest_metadata.biome, "Test Forest");
+        assert!(matches!(ptf_forest.forest_metadata.season, PtfSeason::Autumn));
+        assert_eq!(ptf_forest.forest_metadata.total_trees, 3);
+        
+        assert_eq!(ptf_forest.tree_groups.len(), 2);
+        
+        let oak_group = &ptf_forest.tree_groups[0];
+        assert_eq!(oak_group.tree_file, "sample_Oak_tree.pt");
+        assert_eq!(oak_group.instances.len(), 2);
+        
+        let first_oak = &oak_group.instances[0];
+        assert_eq!(first_oak.position, Vec3::new(-100.0, 0.0, 0.0));
+        assert_eq!(first_oak.scale, 1.2);
+        assert_eq!(first_oak.health_factor, 1.0);
+        assert!(first_oak.tags.contains(&"healthy".to_string()));
+        assert!(first_oak.tags.contains(&"mature".to_string()));
+        assert_eq!(first_oak.custom_properties.get("age_years"), Some(&"45".to_string()));
+    }
+
+    #[test]
+    fn test_ptf_instance_parsing() {
+        // Test basic instance line
+        let instance = PtfForestManager::parse_instance_line(
+            "100.0 50.0 0.0 1.570796 1.5 0.9"
+        ).unwrap();
+        
+        assert_eq!(instance.position, Vec3::new(100.0, 50.0, 0.0));
+        assert!((instance.rotation - 1.570796).abs() < 0.001);
+        assert_eq!(instance.scale, 1.5);
+        assert_eq!(instance.health_factor, 0.9);
+        assert!(instance.tags.is_empty());
+        assert!(instance.custom_properties.is_empty());
+
+        // Test instance with tags
+        let instance_with_tags = PtfForestManager::parse_instance_line(
+            "0.0 0.0 0.0 0.0 1.0 1.0 [healthy,ancient,landmark]"
+        ).unwrap();
+        
+        assert_eq!(instance_with_tags.tags.len(), 3);
+        assert!(instance_with_tags.tags.contains(&"healthy".to_string()));
+        assert!(instance_with_tags.tags.contains(&"ancient".to_string()));
+        assert!(instance_with_tags.tags.contains(&"landmark".to_string()));
+
+        // Test instance with properties
+        let instance_with_props = PtfForestManager::parse_instance_line(
+            "0.0 0.0 0.0 0.0 1.0 1.0 {age_years:50,soil_type:clay,water_access:true}"
+        ).unwrap();
+        
+        assert_eq!(instance_with_props.custom_properties.len(), 3);
+        assert_eq!(instance_with_props.custom_properties.get("age_years"), Some(&"50".to_string()));
+        assert_eq!(instance_with_props.custom_properties.get("soil_type"), Some(&"clay".to_string()));
+        assert_eq!(instance_with_props.custom_properties.get("water_access"), Some(&"true".to_string()));
+
+        // Test instance with both tags and properties
+        let full_instance = PtfForestManager::parse_instance_line(
+            "10.0 20.0 5.0 0.785398 1.2 0.8 [diseased,recovering] {treatment_date:2024-01-15,progress:0.3}"
+        ).unwrap();
+        
+        assert_eq!(full_instance.position, Vec3::new(10.0, 20.0, 5.0));
+        assert_eq!(full_instance.tags.len(), 2);
+        assert_eq!(full_instance.custom_properties.len(), 2);
+    }
+
+    #[test]
+    fn test_ptf_save_load_cycle() {
+        let sample_ptf = PtfForestManager::create_sample_ptf();
+        let temp_path = std::env::temp_dir().join("test_forest.ptf");
+        
+        // Test text format
+        let save_result = PtfForestManager::save_forest(
+            &sample_ptf.forest_metadata,
+            &sample_ptf.tree_groups.iter()
+                .map(|g| (g.tree_file.clone(), g.instances.clone()))
+                .collect::<Vec<_>>(),
+            &temp_path,
+            PtfEncoding::Text,
+        );
+        assert!(save_result.is_ok());
+        
+        let loaded_ptf = PtfForestManager::load_forest(&temp_path).unwrap();
+        assert_eq!(loaded_ptf.forest_metadata.forest_name, sample_ptf.forest_metadata.forest_name);
+        assert_eq!(loaded_ptf.tree_groups.len(), sample_ptf.tree_groups.len());
+        
+        // Test binary format
+        let binary_path = std::env::temp_dir().join("test_forest_binary.ptf");
+        let binary_save = PtfForestManager::save_forest(
+            &sample_ptf.forest_metadata,
+            &sample_ptf.tree_groups.iter()
+                .map(|g| (g.tree_file.clone(), g.instances.clone()))
+                .collect::<Vec<_>>(),
+            &binary_path,
+            PtfEncoding::Binary,
+        );
+        assert!(binary_save.is_ok());
+        
+        let loaded_binary = PtfForestManager::load_forest(&binary_path).unwrap();
+        assert_eq!(loaded_binary.forest_metadata.forest_name, sample_ptf.forest_metadata.forest_name);
+        
+        // Clean up
+        std::fs::remove_file(temp_path).ok();
+        std::fs::remove_file(binary_path).ok();
+    }
+
+    #[test]
+    fn test_ptf_seasonal_modifications() {
+        let mut tree = PixelTree {
+            trunk: TrunkData {
+                base_pos: Vec2::ZERO,
+                height: 100.0,
+                base_width: 8.0,
+                segments: vec![],
+            },
+            branches: vec![],
+            leaves: LeafCluster {
+                leaves: vec![
+                    Leaf {
+                        pos: Vec2::new(0.0, 50.0),
+                        rot: 0.0,
+                        scale: 1.0,
+                        leaf_type: 0,
+                        color: [34, 139, 34], // Forest green
+                    },
+                    Leaf {
+                        pos: Vec2::new(10.0, 60.0),
+                        rot: 0.0,
+                        scale: 1.0,
+                        leaf_type: 1,
+                        color: [34, 139, 34],
+                    },
+                    Leaf {
+                        pos: Vec2::new(-10.0, 65.0),
+                        rot: 0.0,
+                        scale: 1.0,
+                        leaf_type: 2,
+                        color: [34, 139, 34],
+                    },
+                ]
+            },
+            wind_params: WindParams::default(),
+            lod_level: 0,
+            template: TreeTemplate::Default,
+        };
+
+        let instance = PtfTreeInstance {
+            position: Vec3::ZERO,
+            rotation: 0.0,
+            scale: 1.0,
+            health_factor: 1.0,
+            tags: vec![],
+            custom_properties: HashMap::new(),
+        };
+
+        // Test autumn modifications
+        let autumn_metadata = PtfForestMetadata {
+            season: PtfSeason::Autumn,
+            global_wind: WindParams::default(),
+            forest_name: "Test".to_string(),
+            author: "Test".to_string(),
+            created_date: Utc::now(),
+            modified_date: Utc::now(),
+            biome: "Test".to_string(),
+            time_of_day: None,
+            terrain: None,
+            lighting: None,
+            weather: None,
+            total_trees: 1,
+            bounding_box: PtBoundingBox { min: [0.0, 0.0], max: [100.0, 100.0], height: 100.0 },
+            tags: vec![],
+            custom_properties: HashMap::new(),
+        };
+
+        let original_leaf_count = tree.leaves.leaves.len();
+        PtfForestManager::apply_instance_modifications(&mut tree, &instance, &autumn_metadata);
+        
+        // Should still have same number of leaves but colors changed
+        assert_eq!(tree.leaves.leaves.len(), original_leaf_count);
+        // Check that autumn colors were applied
+        assert!(tree.leaves.leaves.iter().any(|leaf| 
+            leaf.color == [255, 69, 0] || leaf.color == [255, 215, 0] || leaf.color == [205, 92, 92]
+        ));
+
+        // Test winter modifications
+        let mut winter_tree = tree.clone();
+        let winter_metadata = PtfForestMetadata {
+            season: PtfSeason::Winter,
+            ..autumn_metadata.clone()
+        };
+
+        PtfForestManager::apply_instance_modifications(&mut winter_tree, &instance, &winter_metadata);
+        
+        // Should have much fewer leaves in winter
+        assert!(winter_tree.leaves.leaves.len() < original_leaf_count);
+        assert!(winter_tree.leaves.leaves.len() <= original_leaf_count / 10);
+    }
+
+    #[test]
+    fn test_ptf_health_factor_modifications() {
+        let mut healthy_tree = generate_test_tree();
+        let mut diseased_tree = healthy_tree.clone();
+        
+        let healthy_instance = PtfTreeInstance {
+            position: Vec3::ZERO,
+            rotation: 0.0,
+            scale: 1.0,
+            health_factor: 1.0,
+            tags: vec!["healthy".to_string()],
+            custom_properties: HashMap::new(),
+        };
+        
+        let diseased_instance = PtfTreeInstance {
+            position: Vec3::ZERO,
+            rotation: 0.0,
+            scale: 1.0,
+            health_factor: 0.4, // Unhealthy
+            tags: vec!["diseased".to_string()],
+            custom_properties: HashMap::new(),
+        };
+
+        let metadata = create_test_metadata();
+        
+        let original_leaf_count = healthy_tree.leaves.leaves.len();
+        
+        // Apply modifications
+        PtfForestManager::apply_instance_modifications(&mut healthy_tree, &healthy_instance, &metadata);
+        PtfForestManager::apply_instance_modifications(&mut diseased_tree, &diseased_instance, &metadata);
+        
+        // Diseased tree should have fewer leaves
+        assert!(diseased_tree.leaves.leaves.len() < healthy_tree.leaves.leaves.len());
+        assert!(diseased_tree.leaves.leaves.len() < (original_leaf_count as f32 * 0.5) as usize);
+        
+        // Diseased tree should have different leaf colors (more brown/yellow)
+        let diseased_colors = diseased_tree.leaves.leaves.iter()
+            .map(|leaf| leaf.color)
+            .collect::<Vec<_>>();
+        let healthy_colors = healthy_tree.leaves.leaves.iter()
+            .map(|leaf| leaf.color)
+            .collect::<Vec<_>>();
+        
+        // At least some colors should be different
+        assert_ne!(diseased_colors, healthy_colors);
+    }
+
+    fn generate_test_tree() -> PixelTree {
+        let mut generator = TreeGenerator::new(12345);
+        generator.generate(&GenerationParams::default())
+    }
+
+    fn create_test_metadata() -> PtfForestMetadata {
+        PtfForestMetadata {
+            forest_name: "Test Forest".to_string(),
+            author: "Test".to_string(),
+            created_date: Utc::now(),
+            modified_date: Utc::now(),
+            biome: "Test Biome".to_string(),
+            season: PtfSeason::Summer,
+            time_of_day: None,
+            global_wind: WindParams::default(),
+            terrain: None,
+            lighting: None,
+            weather: None,
+            total_trees: 1,
+            bounding_box: PtBoundingBox { min: [0.0, 0.0], max: [100.0, 100.0], height: 100.0 },
+            tags: vec![],
+            custom_properties: HashMap::new(),
+        }
+    }
+
+    #[test]
+    #[ignore] // Create sample PTF files
+    fn create_sample_ptf_files() {
+        let sample_ptf = PtfForestManager::create_sample_ptf();
+        
+        // Create text format
+        match PtfForestManager::save_forest(
+            &sample_ptf.forest_metadata,
+            &sample_ptf.tree_groups.iter()
+                .map(|g| (g.tree_file.clone(), g.instances.clone()))
+                .collect::<Vec<_>>(),
+            "examples/ancient_grove.ptf",
+            PtfEncoding::Text,
+        ) {
+            Ok(()) => println!("Created sample PTF file: examples/ancient_grove.ptf"),
+            Err(e) => println!("Failed to create PTF file: {}", e),
+        }
+
+        // Create a winter variant
+        let mut winter_ptf = sample_ptf.clone();
+        winter_ptf.forest_metadata.season = PtfSeason::Winter;
+        winter_ptf.forest_metadata.forest_name = "Winter Grove".to_string();
+        
+        match PtfForestManager::save_forest(
+            &winter_ptf.forest_metadata,
+            &winter_ptf.tree_groups.iter()
+                .map(|g| (g.tree_file.clone(), g.instances.clone()))
+                .collect::<Vec<_>>(),
+            "examples/winter_grove.ptf",
+            PtfEncoding::Text,
+        ) {
+            Ok(()) => println!("Created winter PTF file: examples/winter_grove.ptf"),
+            Err(e) => println!("Failed to create winter PTF file: {}", e),
+        }
+
+        // Create a JSON format for tooling
+        match PtfForestManager::save_forest(
+            &sample_ptf.forest_metadata,
+            &sample_ptf.tree_groups.iter()
+                .map(|g| (g.tree_file.clone(), g.instances.clone()))
+                .collect::<Vec<_>>(),
+            "examples/ancient_grove.json",
+            PtfEncoding::Json,
+        ) {
+            Ok(()) => println!("Created JSON PTF file: examples/ancient_grove.json"),
+            Err(e) => println!("Failed to create JSON PTF file: {}", e),
+        }
+    }
+
+    // ============================================================================
+    // ERROR HANDLING AND SECURITY TESTS
+    // ============================================================================
+
+    #[test]
+    fn test_pt_path_traversal_protection() {
+        let tree = generate_test_tree();
+        let params = GenerationParams::default();
+        
+        // Test various path traversal attempts
+        let malicious_paths = vec![
+            "../../../etc/passwd",
+            "..\\windows\\system32\\config",
+            "/etc/shadow",
+            "test/../../../sensitive.txt",
+            "normal_path\0hidden_path",
+            &"a".repeat(2000), // Very long path
+        ];
+        
+        for path in malicious_paths {
+            let result = PtFileManager::save_tree(&tree, &params, path);
+            assert!(result.is_err(), "Should reject malicious path: {}", path);
+        }
+    }
+
+    #[test]
+    fn test_ptf_path_traversal_protection() {
+        let metadata = create_test_metadata();
+        let tree_groups = vec![("test.pt".to_string(), vec![])];
+        
+        let malicious_paths = vec![
+            "../../../etc/passwd.ptf",
+            "..\\windows\\system32\\config.ptf",
+            "/etc/shadow.ptf",
+            "test/../../../sensitive.ptf",
+            "normal_path\0hidden_path.ptf",
+            &format!("{}.ptf", "a".repeat(2000)),
+        ];
+        
+        for path in malicious_paths {
+            let result = PtfForestManager::save_forest(
+                &metadata, 
+                &tree_groups, 
+                path, 
+                PtfEncoding::Json
+            );
+            assert!(result.is_err(), "Should reject malicious PTF path: {}", path);
+        }
+    }
+
+    #[test]
+    fn test_pt_oversized_data_rejection() {
+        // Create tree with excessive branches
+        let mut oversized_tree = generate_test_tree();
+        
+        // Add way too many branches
+        for i in 0..15000 {  // Exceeds MAX_BRANCHES
+            oversized_tree.trunk.segments.push(TrunkSegment {
+                start_pos: Vec2::new(i as f32, 0.0),
+                end_pos: Vec2::new(i as f32 + 1.0, 1.0),
+                width: 1.0,
+                color: [139, 69, 19],
+            });
+        }
+        
+        let params = GenerationParams::default();
+        let result = PtFileManager::save_tree(&oversized_tree, &params, "test_oversized.pt");
+        assert!(result.is_err(), "Should reject oversized tree data");
+    }
+
+    #[test]
+    fn test_ptf_oversized_data_rejection() {
+        let mut metadata = create_test_metadata();
+        
+        // Add excessive custom properties
+        for i in 0..15000 {  // Exceeds MAX_PTF_CUSTOM_PROPERTIES
+            metadata.custom_properties.insert(
+                format!("prop_{}", i),
+                format!("value_{}", i)
+            );
+        }
+        
+        let tree_groups = vec![("test.pt".to_string(), vec![])];
+        let result = PtfForestManager::save_forest(
+            &metadata, 
+            &tree_groups, 
+            "test_oversized.ptf", 
+            PtfEncoding::Json
+        );
+        assert!(result.is_err(), "Should reject oversized PTF metadata");
+    }
+
+    #[test]
+    fn test_pt_invalid_string_lengths() {
+        let tree = generate_test_tree();
+        let mut params = GenerationParams::default();
+        
+        // Test oversized strings in metadata  
+        params.metadata.tree_name = "a".repeat(2000);  // Exceeds MAX_TREE_NAME_LEN
+        let result = PtFileManager::save_tree(&tree, &params, "test_long_name.pt");
+        assert!(result.is_err(), "Should reject oversized tree name");
+        
+        params.metadata.tree_name = "Normal".to_string();
+        params.metadata.description = "a".repeat(2000);  // Exceeds MAX_DESCRIPTION_LEN
+        let result = PtFileManager::save_tree(&tree, &params, "test_long_desc.pt");
+        assert!(result.is_err(), "Should reject oversized description");
+    }
+
+    #[test]
+    fn test_ptf_invalid_tree_instances() {
+        let metadata = create_test_metadata();
+        
+        // Test invalid scale
+        let invalid_instance = PtfTreeInstance {
+            position: Vec3::ZERO,
+            rotation: 0.0,
+            scale: -1.0,  // Invalid negative scale
+            health_factor: 1.0,
+            tags: vec![],
+            custom_properties: HashMap::new(),
+        };
+        
+        let tree_groups = vec![("test.pt".to_string(), vec![invalid_instance])];
+        let result = PtfForestManager::save_forest(
+            &metadata, 
+            &tree_groups, 
+            "test_invalid.ptf", 
+            PtfEncoding::Json
+        );
+        assert!(result.is_err(), "Should reject invalid tree instance scale");
+        
+        // Test invalid health factor
+        let invalid_health = PtfTreeInstance {
+            position: Vec3::ZERO,
+            rotation: 0.0,
+            scale: 1.0,
+            health_factor: 2.0,  // Invalid > 1.0
+            tags: vec![],
+            custom_properties: HashMap::new(),
+        };
+        
+        let tree_groups = vec![("test.pt".to_string(), vec![invalid_health])];
+        let result = PtfForestManager::save_forest(
+            &metadata, 
+            &tree_groups, 
+            "test_invalid_health.ptf", 
+            PtfEncoding::Json
+        );
+        assert!(result.is_err(), "Should reject invalid health factor");
+    }
+
+    #[test] 
+    fn test_pt_file_corruption_detection() {
+        use std::io::Write;
+        
+        let tree = generate_test_tree();
+        let params = GenerationParams::default();
+        let temp_path = "test_corrupt.pt";
+        
+        // First save a valid file
+        PtFileManager::save_tree(&tree, &params, temp_path).unwrap();
+        
+        // Corrupt the file by truncating it
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(temp_path)
+            .unwrap();
+        file.write_all(b"corrupted").unwrap();
+        drop(file);
+        
+        // Try to load corrupted file
+        let result = PtFileManager::load_tree(temp_path);
+        assert!(result.is_err(), "Should detect corrupted PT file");
+        
+        // Cleanup
+        let _ = std::fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn test_ptf_invalid_bounding_box() {
+        let mut metadata = create_test_metadata();
+        
+        // Test invalid bounding box (min > max)
+        metadata.bounding_box = PtBoundingBox {
+            min: [100.0, 100.0],
+            max: [0.0, 0.0],  // Invalid: max < min
+            height: 100.0,
+        };
+        
+        let tree_groups = vec![("test.pt".to_string(), vec![])];
+        let result = PtfForestManager::save_forest(
+            &metadata, 
+            &tree_groups, 
+            "test_invalid_bbox.ptf", 
+            PtfEncoding::Json
+        );
+        assert!(result.is_err(), "Should reject invalid bounding box");
+        
+        // Test invalid height
+        metadata.bounding_box = PtBoundingBox {
+            min: [0.0, 0.0],
+            max: [100.0, 100.0],
+            height: -1.0,  // Invalid negative height
+        };
+        
+        let result = PtfForestManager::save_forest(
+            &metadata, 
+            &tree_groups, 
+            "test_invalid_height.ptf", 
+            PtfEncoding::Json
+        );
+        assert!(result.is_err(), "Should reject invalid bounding box height");
+    }
+
+    #[test]
+    fn test_atomic_file_operations() {
+        let tree = generate_test_tree();
+        let params = GenerationParams::default();
+        let test_path = "test_atomic.pt";
+        
+        // Save tree
+        PtFileManager::save_tree(&tree, &params, test_path).unwrap();
+        
+        // Verify no temporary files left behind
+        assert!(!std::path::Path::new("test_atomic.pt.tmp").exists());
+        
+        // Verify we can load the file
+        let (loaded_tree, _) = PtFileManager::load_tree(test_path).unwrap();
+        assert_eq!(loaded_tree.trunk.segments.len(), tree.trunk.segments.len());
+        
+        // Cleanup
+        let _ = std::fs::remove_file(test_path);
     }
 }
 

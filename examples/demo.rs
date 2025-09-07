@@ -421,6 +421,7 @@ fn tree_info_display(
              L: Load STF forest\n\
              P: Save selected tree (.pt)\n\
              M: iMport tree from .pt file\n\
+             F: load PTF Forest\n\
              \n\
              Camera: ({:.0}, {:.0})",
             fps_counter.fps,
@@ -902,6 +903,66 @@ fn tree_selection_system(
                     Err(_) => {
                         // Try next file
                         continue;
+                    }
+                }
+            }
+        }
+
+        // Handle PTF forest loading (F key for Forest)
+        if keyboard.just_pressed(KeyCode::KeyF) {
+            println!("Loading PTF forest...");
+            
+            match PtfForestManager::spawn_forest_from_ptf(
+                &mut commands,
+                "examples/ancient_grove.ptf",
+                &mut spatial_index,
+            ) {
+                Ok(entities) => {
+                    println!("Successfully loaded PTF forest with {} trees", entities.len());
+                    
+                    // Trigger sprite creation for all loaded trees
+                    for entity in entities {
+                        commands.spawn(RegeneratedTreeMarker { 
+                            entity,
+                            old_entity: entity,
+                        });
+                    }
+                },
+                Err(e) => {
+                    println!("Failed to load PTF forest: {}", e);
+                    
+                    // Try loading sample forest if ancient_grove.ptf doesn't exist
+                    println!("Attempting to create and load sample PTF forest...");
+                    let sample_ptf = PtfForestManager::create_sample_ptf();
+                    
+                    match PtfForestManager::save_forest(
+                        &sample_ptf.forest_metadata,
+                        &sample_ptf.tree_groups.iter()
+                            .map(|g| (g.tree_file.clone(), g.instances.clone()))
+                            .collect::<Vec<_>>(),
+                        "examples/ancient_grove.ptf",
+                        PtfEncoding::Text,
+                    ) {
+                        Ok(()) => {
+                            println!("Created sample PTF file: examples/ancient_grove.ptf");
+                            // Try loading the newly created file
+                            if let Ok(entities) = PtfForestManager::spawn_forest_from_ptf(
+                                &mut commands,
+                                "examples/ancient_grove.ptf",
+                                &mut spatial_index,
+                            ) {
+                                println!("Successfully loaded sample PTF forest with {} trees", entities.len());
+                                for entity in entities {
+                                    commands.spawn(RegeneratedTreeMarker { 
+                                        entity,
+                                        old_entity: entity,
+                                    });
+                                }
+                            }
+                        },
+                        Err(save_err) => {
+                            println!("Failed to create sample PTF: {}", save_err);
+                        }
                     }
                 }
             }
