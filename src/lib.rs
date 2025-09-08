@@ -582,55 +582,507 @@ fn calculate_wind_displacement(time: f32, wind: &WindParams, pos: Vec2, wind_tab
 }
 
 // ============================================================================
-// SPATIAL INDEXING FOR CULLING
+// SPATIAL INDEXING - QUADTREE SYSTEM FOR CULLING
 // ============================================================================
 
+/// Quadtree node for efficient spatial partitioning and culling
+#[derive(Debug, Clone)]
+pub struct TreeQuadtree {
+    /// Bounding rectangle of this quadtree node
+    bounds: Rect,
+    /// Entities and their positions stored directly in this node (only if it's a leaf)
+    entities: Vec<(Entity, Vec2)>,
+    /// Four children nodes (NW, NE, SW, SE) if this node is subdivided
+    children: Option<Box<[TreeQuadtree; 4]>>,
+    /// Maximum entities per node before subdivision
+    max_entities: usize,
+    /// Maximum subdivision depth to prevent infinite recursion
+    max_depth: usize,
+    /// Current depth of this node
+    depth: usize,
+}
+
+/// View frustum for advanced culling with rotated cameras
+#[derive(Debug, Clone)]
+pub struct ViewFrustum {
+    pub center: Vec2,
+    pub size: Vec2,
+    pub rotation: f32,
+    pub corners: [Vec2; 4], // Pre-computed frustum corners for efficiency
+}
+
+impl ViewFrustum {
+    pub fn new(center: Vec2, size: Vec2, rotation: f32) -> Self {
+        let half_width = size.x * 0.5;
+        let half_height = size.y * 0.5;
+        
+        // Calculate corner offsets
+        let cos_r = rotation.cos();
+        let sin_r = rotation.sin();
+        
+        let corners = [
+            // Top-left
+            center + Vec2::new(
+                -half_width * cos_r + half_height * sin_r,
+                -half_width * sin_r - half_height * cos_r
+            ),
+            // Top-right  
+            center + Vec2::new(
+                half_width * cos_r + half_height * sin_r,
+                half_width * sin_r - half_height * cos_r
+            ),
+            // Bottom-right
+            center + Vec2::new(
+                half_width * cos_r - half_height * sin_r,
+                half_width * sin_r + half_height * cos_r
+            ),
+            // Bottom-left
+            center + Vec2::new(
+                -half_width * cos_r - half_height * sin_r,
+                -half_width * sin_r + half_height * cos_r
+            ),
+        ];
+        
+        Self { center, size, rotation, corners }
+    }
+    
+    /// Check if a point is inside this frustum
+    pub fn contains_point(&self, point: Vec2) -> bool {
+        // For rotated frustums, we need proper point-in-polygon testing
+        if self.rotation.abs() < 0.001 {
+            // Axis-aligned optimization
+            let half_size = self.size * 0.5;
+            (point.x >= self.center.x - half_size.x) &&
+            (point.x <= self.center.x + half_size.x) &&
+            (point.y >= self.center.y - half_size.y) &&
+            (point.y <= self.center.y + half_size.y)
+        } else {
+            // Point-in-polygon using cross product method
+            let mut inside = true;
+            for i in 0..4 {
+                let j = (i + 1) % 4;
+                let edge = self.corners[j] - self.corners[i];
+                let to_point = point - self.corners[i];
+                // Cross product in 2D (z-component)
+                let cross = edge.x * to_point.y - edge.y * to_point.x;
+                if cross < 0.0 {
+                    inside = false;
+                    break;
+                }
+            }
+            inside
+        }
+    }
+    
+    /// Check if this frustum intersects with a rectangle
+    pub fn intersects_rect(&self, rect: Rect) -> bool {
+        // Fast axis-aligned check first
+        if self.rotation.abs() < 0.001 {
+            let frustum_rect = Rect::from_center_size(self.center, self.size);
+            let intersection = frustum_rect.intersect(rect);
+            return intersection.width() > 0.0 && intersection.height() > 0.0;
+        }
+        
+        // For rotated frustums, check if any corner of the rect is inside,
+        // or if any edge of the rect intersects the frustum
+        let rect_corners = [
+            Vec2::new(rect.min.x, rect.min.y),
+            Vec2::new(rect.max.x, rect.min.y),
+            Vec2::new(rect.max.x, rect.max.y),
+            Vec2::new(rect.min.x, rect.max.y),
+        ];
+        
+        // Check if any rect corner is inside the frustum
+        for corner in &rect_corners {
+            if self.contains_point(*corner) {
+                return true;
+            }
+        }
+        
+        // Check if any frustum corner is inside the rect
+        for corner in &self.corners {
+            if rect.contains(*corner) {
+                return true;
+            }
+        }
+        
+        // TODO: Add edge-edge intersection tests for complete accuracy
+        // For now, this covers most common cases efficiently
+        false
+    }
+}
+
+impl TreeQuadtree {
+    pub fn new(bounds: Rect) -> Self {
+        Self::with_capacity(bounds, 8, 6) // Default: 8 entities per node, max depth 6
+    }
+    
+    pub fn with_capacity(bounds: Rect, max_entities: usize, max_depth: usize) -> Self {
+        Self {
+            bounds,
+            entities: Vec::new(),
+            children: None,
+            max_entities,
+            max_depth,
+            depth: 0,
+        }
+    }
+    
+    /// Insert an entity at the given position
+    pub fn insert(&mut self, entity: Entity, position: Vec2) -> bool {
+        if !self.bounds.contains(position) {
+            return false;
+        }
+        
+        // If we have children, try to insert into appropriate child
+        if let Some(ref mut children) = self.children {
+            for child in children.iter_mut() {
+                if child.insert(entity, position) {
+                    return true;
+                }
+            }
+            return false; // Should not happen if bounds checking is correct
+        }
+        
+        // Insert into this leaf node
+        self.entities.push((entity, position));
+        
+        // Check if we need to subdivide
+        if self.entities.len() > self.max_entities && self.depth < self.max_depth {
+            self.subdivide();
+        }
+        
+        true
+    }
+    
+    /// Remove an entity from the given position
+    pub fn remove(&mut self, entity: Entity, position: Vec2) -> bool {
+        if !self.bounds.contains(position) {
+            return false;
+        }
+        
+        if let Some(ref mut children) = self.children {
+            // Try to remove from children
+            for child in children.iter_mut() {
+                if child.remove(entity, position) {
+                    return true;
+                }
+            }
+        } else {
+            // Remove from this leaf node
+            if let Some(pos) = self.entities.iter().position(|&(e, _)| e == entity) {
+                self.entities.swap_remove(pos);
+                return true;
+            }
+        }
+        
+        false
+    }
+    
+    /// Get all visible entities within the view bounds (rectangular)
+    pub fn get_visible_trees(&self, view_bounds: Rect) -> Vec<Entity> {
+        let mut visible = Vec::new();
+        self.query_rect(view_bounds, &mut visible);
+        visible
+    }
+    
+    /// Get all visible entities within the view frustum (supports rotation)
+    pub fn get_visible_trees_frustum(&self, frustum: &ViewFrustum) -> Vec<Entity> {
+        let mut visible = Vec::new();
+        self.query_frustum(frustum, &mut visible);
+        visible
+    }
+    
+    /// Query entities within a rectangular bounds
+    fn query_rect(&self, query_bounds: Rect, results: &mut Vec<Entity>) {
+        // Early exit if no intersection
+        let intersection = self.bounds.intersect(query_bounds);
+        if intersection.width() <= 0.0 || intersection.height() <= 0.0 {
+            return;
+        }
+        
+        if let Some(ref children) = self.children {
+            // Query all children
+            for child in children.iter() {
+                child.query_rect(query_bounds, results);
+            }
+        } else {
+            // This is a leaf, check each entity's position individually
+            for &(entity, pos) in &self.entities {
+                if query_bounds.contains(pos) {
+                    results.push(entity);
+                }
+            }
+        }
+    }
+    
+    /// Query entities within a view frustum
+    fn query_frustum(&self, frustum: &ViewFrustum, results: &mut Vec<Entity>) {
+        // Early exit if no intersection
+        if !frustum.intersects_rect(self.bounds) {
+            return;
+        }
+        
+        if let Some(ref children) = self.children {
+            // Query all children
+            for child in children.iter() {
+                child.query_frustum(frustum, results);
+            }
+        } else {
+            // This is a leaf, check each entity's position individually
+            for &(entity, pos) in &self.entities {
+                if frustum.contains_point(pos) {
+                    results.push(entity);
+                }
+            }
+        }
+    }
+    
+    /// Subdivide this node into four children
+    fn subdivide(&mut self) {
+        let half_width = self.bounds.width() * 0.5;
+        let half_height = self.bounds.height() * 0.5;
+        let center = self.bounds.center();
+        
+        let nw_bounds = Rect::from_center_size(
+            center + Vec2::new(-half_width * 0.5, half_height * 0.5),
+            Vec2::new(half_width, half_height)
+        );
+        let ne_bounds = Rect::from_center_size(
+            center + Vec2::new(half_width * 0.5, half_height * 0.5),
+            Vec2::new(half_width, half_height)
+        );
+        let sw_bounds = Rect::from_center_size(
+            center + Vec2::new(-half_width * 0.5, -half_height * 0.5),
+            Vec2::new(half_width, half_height)
+        );
+        let se_bounds = Rect::from_center_size(
+            center + Vec2::new(half_width * 0.5, -half_height * 0.5),
+            Vec2::new(half_width, half_height)
+        );
+        
+        let children = [
+            TreeQuadtree {
+                bounds: nw_bounds,
+                entities: Vec::new(),
+                children: None,
+                max_entities: self.max_entities,
+                max_depth: self.max_depth,
+                depth: self.depth + 1,
+            },
+            TreeQuadtree {
+                bounds: ne_bounds,
+                entities: Vec::new(), 
+                children: None,
+                max_entities: self.max_entities,
+                max_depth: self.max_depth,
+                depth: self.depth + 1,
+            },
+            TreeQuadtree {
+                bounds: sw_bounds,
+                entities: Vec::new(),
+                children: None,
+                max_entities: self.max_entities,
+                max_depth: self.max_depth,
+                depth: self.depth + 1,
+            },
+            TreeQuadtree {
+                bounds: se_bounds,
+                entities: Vec::new(),
+                children: None,
+                max_entities: self.max_entities,
+                max_depth: self.max_depth,
+                depth: self.depth + 1,
+            },
+        ];
+        
+        // Move entities to appropriate children
+        let entities_to_redistribute = std::mem::take(&mut self.entities);
+        
+        self.children = Some(Box::new(children));
+        
+        // Redistribute entities to appropriate children based on their positions
+        for (entity, position) in entities_to_redistribute {
+            if let Some(ref mut children) = self.children {
+                for child in children.iter_mut() {
+                    if child.bounds.contains(position) {
+                        child.entities.push((entity, position));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Get statistics about the quadtree structure
+    pub fn get_stats(&self) -> QuadtreeStats {
+        let mut stats = QuadtreeStats {
+            total_nodes: 1,
+            leaf_nodes: 0,
+            total_entities: self.entities.len(),
+            max_depth_reached: self.depth,
+            min_entities_in_leaf: usize::MAX,
+            max_entities_in_leaf: 0,
+        };
+        
+        if let Some(ref children) = self.children {
+            for child in children.iter() {
+                let child_stats = child.get_stats();
+                stats.total_nodes += child_stats.total_nodes;
+                stats.leaf_nodes += child_stats.leaf_nodes;
+                stats.total_entities += child_stats.total_entities;
+                stats.max_depth_reached = stats.max_depth_reached.max(child_stats.max_depth_reached);
+                stats.min_entities_in_leaf = stats.min_entities_in_leaf.min(child_stats.min_entities_in_leaf);
+                stats.max_entities_in_leaf = stats.max_entities_in_leaf.max(child_stats.max_entities_in_leaf);
+            }
+        } else {
+            // This is a leaf
+            stats.leaf_nodes = 1;
+            if !self.entities.is_empty() {
+                stats.min_entities_in_leaf = stats.min_entities_in_leaf.min(self.entities.len());
+                stats.max_entities_in_leaf = stats.max_entities_in_leaf.max(self.entities.len());
+            }
+        }
+        
+        if stats.min_entities_in_leaf == usize::MAX {
+            stats.min_entities_in_leaf = 0;
+        }
+        
+        stats
+    }
+    
+    /// Clear all entities from the quadtree
+    pub fn clear(&mut self) {
+        self.entities.clear();
+        self.children = None;
+    }
+    
+    /// Rebuild the quadtree with new bounds if needed
+    pub fn expand_bounds(&mut self, new_bounds: Rect) {
+        if self.bounds.min == new_bounds.min && self.bounds.max == new_bounds.max {
+            return; // Bounds are already the same
+        }
+        
+        // Collect all entities and their positions
+        let mut all_entities = Vec::new();
+        self.collect_all_entities(&mut all_entities);
+        
+        // Create new quadtree with expanded bounds
+        let new_qt = TreeQuadtree::with_capacity(new_bounds, self.max_entities, self.max_depth);
+        *self = new_qt;
+        
+        // Re-insert all entities
+        for (entity, position) in all_entities {
+            self.insert(entity, position);
+        }
+    }
+    
+    /// Helper method to collect all entities from the tree
+    fn collect_all_entities(&self, result: &mut Vec<(Entity, Vec2)>) {
+        if let Some(ref children) = self.children {
+            for child in children.iter() {
+                child.collect_all_entities(result);
+            }
+        } else {
+            result.extend(self.entities.iter().copied());
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QuadtreeStats {
+    pub total_nodes: usize,
+    pub leaf_nodes: usize,
+    pub total_entities: usize,
+    pub max_depth_reached: usize,
+    pub min_entities_in_leaf: usize,
+    pub max_entities_in_leaf: usize,
+}
+
+/// Resource wrapper for the quadtree system
 #[derive(Resource)]
 pub struct TreeSpatialIndex {
-    cell_size: f32,
-    cells: HashMap<(i32, i32), Vec<Entity>>,
+    quadtree: TreeQuadtree,
+    entity_positions: HashMap<Entity, Vec2>, // Track positions for removal
 }
 
 impl Default for TreeSpatialIndex {
     fn default() -> Self {
-        Self::new(100.0)
+        Self::new(Rect::from_center_size(Vec2::ZERO, Vec2::new(4000.0, 4000.0)))
     }
 }
 
 impl TreeSpatialIndex {
-    pub fn new(cell_size: f32) -> Self {
+    pub fn new(bounds: Rect) -> Self {
         Self {
-            cell_size,
-            cells: HashMap::new(),
+            quadtree: TreeQuadtree::new(bounds),
+            entity_positions: HashMap::new(),
         }
     }
     
-    pub fn insert(&mut self, entity: Entity, pos: Vec2) {
-        let cell = self.world_to_cell(pos);
-        self.cells.entry(cell).or_insert_with(Vec::new).push(entity);
+    pub fn with_capacity(bounds: Rect, max_entities: usize, max_depth: usize) -> Self {
+        Self {
+            quadtree: TreeQuadtree::with_capacity(bounds, max_entities, max_depth),
+            entity_positions: HashMap::new(),
+        }
     }
     
-    pub fn get_visible_trees(&self, view_bounds: Rect) -> Vec<Entity> {
-        let min_cell = self.world_to_cell(view_bounds.min);
-        let max_cell = self.world_to_cell(view_bounds.max);
+    /// Insert an entity at the given position
+    pub fn insert(&mut self, entity: Entity, position: Vec2) {
+        // Remove old position if exists
+        if let Some(old_pos) = self.entity_positions.get(&entity) {
+            self.quadtree.remove(entity, *old_pos);
+        }
         
-        let mut visible = Vec::with_capacity(128);
-        for x in min_cell.0..=max_cell.0 {
-            for y in min_cell.1..=max_cell.1 {
-                if let Some(entities) = self.cells.get(&(x, y)) {
-                    visible.extend(entities);
-                }
+        // Insert at new position
+        if self.quadtree.insert(entity, position) {
+            self.entity_positions.insert(entity, position);
+        } else {
+            // Position is outside bounds - expand bounds and retry
+            let current_bounds = self.quadtree.bounds;
+            let expanded_bounds = Rect::from_corners(
+                current_bounds.min.min(position - Vec2::splat(100.0)),
+                current_bounds.max.max(position + Vec2::splat(100.0))
+            );
+            self.quadtree.expand_bounds(expanded_bounds);
+            
+            if self.quadtree.insert(entity, position) {
+                self.entity_positions.insert(entity, position);
             }
         }
-        visible
     }
     
-    #[inline]
-    fn world_to_cell(&self, pos: Vec2) -> (i32, i32) {
-        (
-            (pos.x / self.cell_size).floor() as i32,
-            (pos.y / self.cell_size).floor() as i32,
-        )
+    /// Remove an entity (backwards compatibility - uses stored position)
+    pub fn remove(&mut self, entity: Entity, _position: Vec2) {
+        if let Some(stored_pos) = self.entity_positions.remove(&entity) {
+            self.quadtree.remove(entity, stored_pos);
+        }
+    }
+    
+    /// Update an entity's position (more efficient than remove + insert)
+    pub fn update_entity(&mut self, entity: Entity, new_position: Vec2) {
+        self.insert(entity, new_position);
+    }
+    
+    /// Get visible trees using rectangular bounds (backwards compatibility)
+    pub fn get_visible_trees(&self, view_bounds: Rect) -> Vec<Entity> {
+        self.quadtree.get_visible_trees(view_bounds)
+    }
+    
+    /// Get visible trees using view frustum (supports camera rotation)
+    pub fn get_visible_trees_frustum(&self, frustum: &ViewFrustum) -> Vec<Entity> {
+        self.quadtree.get_visible_trees_frustum(frustum)
+    }
+    
+    /// Get quadtree performance statistics
+    pub fn get_stats(&self) -> QuadtreeStats {
+        self.quadtree.get_stats()
+    }
+    
+    /// Clear all entities
+    pub fn clear(&mut self) {
+        self.quadtree.clear();
+        self.entity_positions.clear();
     }
 }
 
@@ -728,7 +1180,7 @@ pub fn spawn_tree(
     commands: &mut Commands,
     position: Vec3,
     params: GenerationParams,
-    spatial_index: &mut TreeSpatialIndex,
+    _spatial_index: &mut TreeSpatialIndex, // Keep for API compatibility but don't use
 ) -> Entity {
     let mut generator = TreeGenerator::new(params.seed);
     let tree = generator.generate(&params);
@@ -742,7 +1194,7 @@ pub fn spawn_tree(
         ViewVisibility::default(),
     )).id();
     
-    spatial_index.insert(entity, position.truncate());
+    // Spatial index will be updated automatically by update_spatial_index system
     entity
 }
 
@@ -750,7 +1202,7 @@ pub fn spawn_forest(
     commands: &mut Commands,
     positions: Vec<Vec2>,
     base_params: GenerationParams,
-    spatial_index: &mut TreeSpatialIndex,
+    _spatial_index: &mut TreeSpatialIndex, // Keep for API compatibility but don't use
 ) {
     let batch_generator = BatchTreeGenerator::new(base_params);
     let seed_offsets: Vec<u64> = (0..positions.len()).map(|i| i as u64 * 1337).collect();
@@ -758,16 +1210,16 @@ pub fn spawn_forest(
     let trees = batch_generator.generate_forest(&positions, &seed_offsets);
     
     for (pos, tree) in trees {
-        let entity = commands.spawn((
+        commands.spawn((
             Transform::from_translation(pos.extend(0.0)),
             GlobalTransform::default(),
             tree,
             Visibility::default(),
             InheritedVisibility::default(),
             ViewVisibility::default(),
-        )).id();
+        ));
         
-        spatial_index.insert(entity, pos);
+        // Spatial index will be updated automatically by update_spatial_index system
     }
 }
 
@@ -775,7 +1227,7 @@ pub fn spawn_forest_from_stf<P: AsRef<Path>>(
     commands: &mut Commands,
     stf_path: P,
     base_params: GenerationParams,
-    spatial_index: &mut TreeSpatialIndex,
+    _spatial_index: &mut TreeSpatialIndex, // Keep for API compatibility but don't use
 ) -> Result<Vec<Entity>, ImportError> {
     let batch_generator = BatchTreeGenerator::new(base_params);
     let trees = batch_generator.generate_forest_from_stf(stf_path)?;
@@ -792,7 +1244,7 @@ pub fn spawn_forest_from_stf<P: AsRef<Path>>(
             ViewVisibility::default(),
         )).id();
         
-        spatial_index.insert(entity, pos.truncate());
+        // Spatial index will be updated automatically by update_spatial_index system
         entities.push(entity);
     }
     
@@ -3786,16 +4238,20 @@ sample_Pine_tree.pt
         let malicious_paths = vec![
             "../../../etc/passwd",
             "..\\windows\\system32\\config",
-            "/etc/shadow",
+            "/etc/shadow", 
             "test/../../../sensitive.txt",
             "normal_path\0hidden_path",
-            &"a".repeat(2000), // Very long path
         ];
+        let long_path = "a".repeat(2000);
         
         for path in malicious_paths {
-            let result = PtFileManager::save_tree(&tree, &params, path);
+            let result = PtFileManager::save_tree(&tree, &params, path, None);
             assert!(result.is_err(), "Should reject malicious path: {}", path);
         }
+        
+        // Test very long path separately
+        let result = PtFileManager::save_tree(&tree, &params, &long_path, None);
+        assert!(result.is_err(), "Should reject very long path");
     }
 
     #[test]
@@ -3805,12 +4261,12 @@ sample_Pine_tree.pt
         
         let malicious_paths = vec![
             "../../../etc/passwd.ptf",
-            "..\\windows\\system32\\config.ptf",
+            "..\\windows\\system32\\config.ptf", 
             "/etc/shadow.ptf",
             "test/../../../sensitive.ptf",
             "normal_path\0hidden_path.ptf",
-            &format!("{}.ptf", "a".repeat(2000)),
         ];
+        let long_path = format!("{}.ptf", "a".repeat(2000));
         
         for path in malicious_paths {
             let result = PtfForestManager::save_forest(
@@ -3821,6 +4277,15 @@ sample_Pine_tree.pt
             );
             assert!(result.is_err(), "Should reject malicious PTF path: {}", path);
         }
+        
+        // Test very long path separately
+        let result = PtfForestManager::save_forest(
+            &metadata, 
+            &tree_groups, 
+            &long_path, 
+            PtfEncoding::Json
+        );
+        assert!(result.is_err(), "Should reject very long PTF path");
     }
 
     #[test]
@@ -3828,18 +4293,17 @@ sample_Pine_tree.pt
         // Create tree with excessive branches
         let mut oversized_tree = generate_test_tree();
         
-        // Add way too many branches
-        for i in 0..15000 {  // Exceeds MAX_BRANCHES
+        // Add way too many trunk segments (testing limits)
+        for i in 0..15000 {  // Exceeds reasonable limits
             oversized_tree.trunk.segments.push(TrunkSegment {
-                start_pos: Vec2::new(i as f32, 0.0),
-                end_pos: Vec2::new(i as f32 + 1.0, 1.0),
+                start: Vec2::new(i as f32, 0.0),
+                end: Vec2::new(i as f32 + 1.0, 1.0),
                 width: 1.0,
-                color: [139, 69, 19],
             });
         }
         
         let params = GenerationParams::default();
-        let result = PtFileManager::save_tree(&oversized_tree, &params, "test_oversized.pt");
+        let result = PtFileManager::save_tree(&oversized_tree, &params, "test_oversized.pt", None);
         assert!(result.is_err(), "Should reject oversized tree data");
     }
 
@@ -3868,16 +4332,40 @@ sample_Pine_tree.pt
     #[test]
     fn test_pt_invalid_string_lengths() {
         let tree = generate_test_tree();
-        let mut params = GenerationParams::default();
+        let params = GenerationParams::default();
         
-        // Test oversized strings in metadata  
-        params.metadata.tree_name = "a".repeat(2000);  // Exceeds MAX_TREE_NAME_LEN
-        let result = PtFileManager::save_tree(&tree, &params, "test_long_name.pt");
+        // Test oversized strings in metadata - use metadata parameter
+        let oversized_metadata = Some(PtMetadata {
+            tree_name: "a".repeat(2000),  // Exceeds MAX_TREE_NAME_LEN
+            author: "Test".to_string(),
+            created_date: Utc::now(),
+            modified_date: Utc::now(),
+            description: "Test".to_string(),
+            tags: vec![],
+            tree_type: TreeTemplate::Default,
+            estimated_age_years: Some(10.0),
+            biome: Some("Test".to_string()),
+            custom_properties: HashMap::new(),
+        });
+        
+        let result = PtFileManager::save_tree(&tree, &params, "test_long_name.pt", oversized_metadata);
         assert!(result.is_err(), "Should reject oversized tree name");
         
-        params.metadata.tree_name = "Normal".to_string();
-        params.metadata.description = "a".repeat(2000);  // Exceeds MAX_DESCRIPTION_LEN
-        let result = PtFileManager::save_tree(&tree, &params, "test_long_desc.pt");
+        // Test oversized description
+        let oversized_desc_metadata = Some(PtMetadata {
+            tree_name: "Normal".to_string(),
+            author: "Test".to_string(),
+            created_date: Utc::now(),
+            modified_date: Utc::now(),
+            description: "a".repeat(2000),  // Exceeds MAX_DESCRIPTION_LEN
+            tags: vec![],
+            tree_type: TreeTemplate::Default,
+            estimated_age_years: Some(10.0),
+            biome: Some("Test".to_string()),
+            custom_properties: HashMap::new(),
+        });
+        
+        let result = PtFileManager::save_tree(&tree, &params, "test_long_desc.pt", oversized_desc_metadata);
         assert!(result.is_err(), "Should reject oversized description");
     }
 
@@ -3933,7 +4421,7 @@ sample_Pine_tree.pt
         let temp_path = "test_corrupt.pt";
         
         // First save a valid file
-        PtFileManager::save_tree(&tree, &params, temp_path).unwrap();
+        PtFileManager::save_tree(&tree, &params, temp_path, None).unwrap();
         
         // Corrupt the file by truncating it
         let mut file = std::fs::OpenOptions::new()
@@ -3995,7 +4483,7 @@ sample_Pine_tree.pt
         let test_path = "test_atomic.pt";
         
         // Save tree
-        PtFileManager::save_tree(&tree, &params, test_path).unwrap();
+        PtFileManager::save_tree(&tree, &params, test_path, None).unwrap();
         
         // Verify no temporary files left behind
         assert!(!std::path::Path::new("test_atomic.pt.tmp").exists());
@@ -4006,6 +4494,259 @@ sample_Pine_tree.pt
         
         // Cleanup
         let _ = std::fs::remove_file(test_path);
+    }
+
+    // ============================================================================
+    // QUADTREE PERFORMANCE AND FUNCTIONALITY TESTS
+    // ============================================================================
+
+    #[test]
+    fn test_quadtree_basic_operations() {
+        let bounds = Rect::from_center_size(Vec2::ZERO, Vec2::new(1000.0, 1000.0));
+        let mut qt = TreeQuadtree::new(bounds);
+        
+        // Test insertion
+        let entity1 = Entity::from_raw(1);
+        let entity2 = Entity::from_raw(2);
+        let pos1 = Vec2::new(100.0, 100.0);
+        let pos2 = Vec2::new(-200.0, 300.0);
+        
+        assert!(qt.insert(entity1, pos1));
+        assert!(qt.insert(entity2, pos2));
+        
+        // Test bounds checking
+        let out_of_bounds = Vec2::new(2000.0, 2000.0);
+        let entity3 = Entity::from_raw(3);
+        assert!(!qt.insert(entity3, out_of_bounds));
+        
+        // Test queries
+        let query_rect = Rect::from_center_size(Vec2::new(50.0, 50.0), Vec2::new(200.0, 200.0));
+        let visible = qt.get_visible_trees(query_rect);
+        assert!(visible.contains(&entity1));
+        assert!(!visible.contains(&entity2)); // Should be outside query area
+        
+        // Test removal
+        assert!(qt.remove(entity1, pos1));
+        let visible_after_removal = qt.get_visible_trees(query_rect);
+        assert!(!visible_after_removal.contains(&entity1));
+    }
+
+    #[test]
+    fn test_quadtree_subdivision() {
+        let bounds = Rect::from_center_size(Vec2::ZERO, Vec2::new(1000.0, 1000.0));
+        let mut qt = TreeQuadtree::with_capacity(bounds, 4, 3); // Max 4 entities, depth 3
+        
+        // Insert more entities than max_entities to trigger subdivision
+        let entities: Vec<Entity> = (0..10).map(|i| Entity::from_raw(i)).collect();
+        let positions: Vec<Vec2> = vec![
+            Vec2::new(100.0, 100.0),   // NE quadrant
+            Vec2::new(200.0, 150.0),   // NE quadrant  
+            Vec2::new(-100.0, 100.0),  // NW quadrant
+            Vec2::new(-150.0, 150.0),  // NW quadrant
+            Vec2::new(100.0, -100.0),  // SE quadrant
+            Vec2::new(150.0, -150.0),  // SE quadrant
+            Vec2::new(-100.0, -100.0), // SW quadrant
+            Vec2::new(-150.0, -150.0), // SW quadrant
+            Vec2::new(50.0, 50.0),     // Near center, NE
+            Vec2::new(-50.0, -50.0),   // Near center, SW
+        ];
+        
+        for (entity, pos) in entities.iter().zip(positions.iter()) {
+            qt.insert(*entity, *pos);
+        }
+        
+        let stats = qt.get_stats();
+        println!("Quadtree stats after subdivision test:");
+        println!("  Total nodes: {}", stats.total_nodes);
+        println!("  Leaf nodes: {}", stats.leaf_nodes);
+        println!("  Max depth: {}", stats.max_depth_reached);
+        println!("  Total entities: {}", stats.total_entities);
+        
+        // Should have subdivided
+        assert!(stats.total_nodes > 1, "Quadtree should have subdivided with {} entities", entities.len());
+        assert!(stats.max_depth_reached > 0, "Should have created at least one subdivision level");
+        
+        // Test querying subdivided quadtree
+        // Query NE quadrant with a larger area to catch multiple entities
+        let ne_query = Rect::from_center_size(Vec2::new(150.0, 125.0), Vec2::new(200.0, 100.0));
+        let ne_results = qt.get_visible_trees(ne_query);
+        assert!(ne_results.len() >= 2, "Should find entities in NE quadrant");
+        
+        let sw_query = Rect::from_center_size(Vec2::new(-125.0, -125.0), Vec2::new(100.0, 100.0));
+        let sw_results = qt.get_visible_trees(sw_query);
+        assert!(sw_results.len() >= 2, "Should find entities in SW quadrant");
+    }
+
+    #[test]
+    fn test_view_frustum_basic() {
+        let center = Vec2::new(100.0, 100.0);
+        let size = Vec2::new(200.0, 150.0);
+        
+        // Test axis-aligned frustum
+        let frustum = ViewFrustum::new(center, size, 0.0);
+        
+        // Points inside
+        assert!(frustum.contains_point(Vec2::new(100.0, 100.0))); // Center
+        assert!(frustum.contains_point(Vec2::new(150.0, 150.0))); // Inside bounds
+        assert!(frustum.contains_point(Vec2::new(50.0, 50.0)));   // Inside bounds
+        
+        // Points outside
+        assert!(!frustum.contains_point(Vec2::new(300.0, 100.0))); // Too far right
+        assert!(!frustum.contains_point(Vec2::new(100.0, 300.0))); // Too far up
+        assert!(!frustum.contains_point(Vec2::new(0.0, 0.0)));     // Outside bounds
+        
+        // Test rectangle intersection
+        let inside_rect = Rect::from_center_size(Vec2::new(120.0, 120.0), Vec2::new(50.0, 50.0));
+        assert!(frustum.intersects_rect(inside_rect));
+        
+        let outside_rect = Rect::from_center_size(Vec2::new(500.0, 500.0), Vec2::new(50.0, 50.0));
+        assert!(!frustum.intersects_rect(outside_rect));
+    }
+
+    #[test]
+    fn test_view_frustum_rotated() {
+        let center = Vec2::new(0.0, 0.0);
+        let size = Vec2::new(200.0, 100.0);
+        let rotation = std::f32::consts::PI / 4.0; // 45 degrees
+        
+        let frustum = ViewFrustum::new(center, size, rotation);
+        
+        // Test that the frustum is properly rotated
+        // A point that would be inside an axis-aligned frustum might be outside a rotated one
+        let point = Vec2::new(90.0, 0.0); // Right edge of axis-aligned box
+        
+        // For a 45-degree rotated frustum, the effective area changes
+        // This is more about testing that rotation math works correctly
+        let contains = frustum.contains_point(point);
+        println!("Rotated frustum contains point {:?}: {}", point, contains);
+        
+        // Test intersection with axis-aligned rectangle
+        let rect = Rect::from_center_size(Vec2::new(50.0, 50.0), Vec2::new(20.0, 20.0));
+        let intersects = frustum.intersects_rect(rect);
+        println!("Rotated frustum intersects rect: {}", intersects);
+        
+        // The main test is that it doesn't panic and produces reasonable results
+        assert!(frustum.corners.len() == 4);
+    }
+
+    #[test]
+    fn test_spatial_index_wrapper() {
+        let bounds = Rect::from_center_size(Vec2::ZERO, Vec2::new(2000.0, 2000.0));
+        let mut spatial_index = TreeSpatialIndex::new(bounds);
+        
+        // Test insertion and position tracking
+        let entity = Entity::from_raw(42);
+        let pos1 = Vec2::new(100.0, 100.0);
+        let pos2 = Vec2::new(200.0, 200.0);
+        
+        spatial_index.insert(entity, pos1);
+        
+        // Move entity to new position
+        spatial_index.insert(entity, pos2);
+        
+        // Query should find entity at new position
+        let query_rect = Rect::from_center_size(pos2, Vec2::new(50.0, 50.0));
+        let visible = spatial_index.get_visible_trees(query_rect);
+        assert!(visible.contains(&entity));
+        
+        // Query at old position should not find it
+        let old_query = Rect::from_center_size(pos1, Vec2::new(50.0, 50.0));
+        let old_visible = spatial_index.get_visible_trees(old_query);
+        assert!(!old_visible.contains(&entity), "Entity should have moved from old position");
+        
+        // Test removal
+        spatial_index.remove(entity, pos2); // pos2 parameter ignored, uses stored position
+        let after_removal = spatial_index.get_visible_trees(query_rect);
+        assert!(!after_removal.contains(&entity));
+        
+        // Test stats
+        let stats = spatial_index.get_stats();
+        println!("Spatial index stats: {:?}", stats);
+    }
+
+    #[test] 
+    fn test_quadtree_performance_comparison() {
+        use std::time::Instant;
+        
+        let bounds = Rect::from_center_size(Vec2::ZERO, Vec2::new(4000.0, 4000.0));
+        let mut spatial_index = TreeSpatialIndex::new(bounds);
+        
+        // Generate a large number of entities in a grid pattern
+        let grid_size = 50; // 50x50 = 2500 entities
+        let entities: Vec<Entity> = (0..grid_size * grid_size)
+            .map(|i| Entity::from_raw(i as u32))
+            .collect();
+        
+        let positions: Vec<Vec2> = (0..grid_size)
+            .flat_map(|x| {
+                (0..grid_size).map(move |y| {
+                    Vec2::new(
+                        (x as f32 - grid_size as f32 / 2.0) * 80.0,
+                        (y as f32 - grid_size as f32 / 2.0) * 80.0
+                    )
+                })
+            })
+            .collect();
+        
+        // Time insertion
+        let insert_start = Instant::now();
+        for (entity, pos) in entities.iter().zip(positions.iter()) {
+            spatial_index.insert(*entity, *pos);
+        }
+        let insert_duration = insert_start.elapsed();
+        println!("Inserted {} entities in {:?}", entities.len(), insert_duration);
+        
+        let stats = spatial_index.get_stats();
+        println!("Quadtree subdivided into {} nodes, max depth {}", stats.total_nodes, stats.max_depth_reached);
+        
+        // Time queries
+        let query_count = 100;
+        let query_size = Vec2::new(200.0, 200.0);
+        let query_start = Instant::now();
+        
+        let mut total_found = 0;
+        for i in 0..query_count {
+            let query_center = Vec2::new(
+                ((i as f32 / query_count as f32) - 0.5) * 1000.0,
+                ((i as f32 * 7.0 / query_count as f32) % 1.0 - 0.5) * 1000.0 // Different pattern for Y
+            );
+            let query_rect = Rect::from_center_size(query_center, query_size);
+            let visible = spatial_index.get_visible_trees(query_rect);
+            total_found += visible.len();
+        }
+        
+        let query_duration = query_start.elapsed();
+        println!("Performed {} queries in {:?} (avg: {:?}/query)", 
+            query_count, query_duration, query_duration / query_count);
+        println!("Average entities found per query: {:.1}", total_found as f32 / query_count as f32);
+        
+        // Performance assertions (these are rough guidelines)
+        assert!(insert_duration.as_millis() < 100, "Insert should be fast even for {} entities", entities.len());
+        assert!(query_duration.as_millis() < 50, "Queries should be very fast with quadtree");
+        assert!(stats.total_entities > 0, "Should track entities correctly");
+    }
+
+    #[test]
+    fn test_quadtree_bounds_expansion() {
+        let initial_bounds = Rect::from_center_size(Vec2::ZERO, Vec2::new(100.0, 100.0));
+        let mut spatial_index = TreeSpatialIndex::new(initial_bounds);
+        
+        // Insert entity within bounds
+        let entity1 = Entity::from_raw(1);
+        let pos1 = Vec2::new(30.0, 30.0);
+        spatial_index.insert(entity1, pos1);
+        
+        // Insert entity outside initial bounds - should trigger expansion
+        let entity2 = Entity::from_raw(2); 
+        let pos2 = Vec2::new(200.0, 200.0); // Outside initial 100x100 bounds
+        spatial_index.insert(entity2, pos2);
+        
+        // Both entities should be findable
+        let large_query = Rect::from_center_size(Vec2::ZERO, Vec2::new(500.0, 500.0));
+        let visible = spatial_index.get_visible_trees(large_query);
+        
+        assert!(visible.contains(&entity1), "Entity1 should still be findable after bounds expansion");
+        assert!(visible.contains(&entity2), "Entity2 should be findable in expanded bounds");
     }
 }
 

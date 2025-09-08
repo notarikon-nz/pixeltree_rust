@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
+use bevy::math::EulerRot;
 use bevy_light_2d::prelude::*;
 use pixeltree::*;
 use bytemuck::{Pod, Zeroable};
@@ -26,8 +27,10 @@ fn main() {
         .init_resource::<LeafSpritePool>()
         .insert_resource(FpsCounter { fps: 0.0, frame_count: 0, timer: 0.0 })
         .add_systems(Startup, setup_demo)
+        .add_systems(PostStartup, update_spatial_index) // Handle initial entities
         .add_systems(Update, (
             camera_controls,
+            update_spatial_index.before(tree_info_display), // NEW: Keep spatial index in sync
             tree_info_display,
             render_trees,
             update_leaf_instances,
@@ -214,7 +217,7 @@ fn camera_controls(
             transform.scale = Vec3::splat(zoom.0);
         }
         
-        // Camera tilt controls (R/F keys for Y-axis rotation)
+        // Camera tilt controls (R/F keys for Y-axis rotation) - showcases frustum culling
         if keyboard.pressed(KeyCode::KeyR) {
             let rotation_speed = 1.0 * time.delta_secs();
             transform.rotation = transform.rotation * Quat::from_rotation_z(rotation_speed);
@@ -372,6 +375,28 @@ fn tree_info_display(
         let visible_trees = spatial_index.get_visible_trees(view_bounds);
         let total_trees = tree_query.iter().count();
         
+        // Debug output every few seconds to trace the issue
+        static mut DEBUG_TIMER: f32 = 0.0;
+        unsafe {
+            DEBUG_TIMER += time.delta_secs();
+            if DEBUG_TIMER > 3.0 {
+                let qt_stats = spatial_index.get_stats();
+                println!("📊 tree_info_display: Camera at ({:.0},{:.0}), Zoom: {:.1}x", camera_pos.x, camera_pos.y, zoom.0);
+                println!("   View bounds: ({:.0},{:.0}) to ({:.0},{:.0}) [size: {:.0}x{:.0}]", 
+                        view_bounds.min.x, view_bounds.min.y, view_bounds.max.x, view_bounds.max.y,
+                        view_bounds.width(), view_bounds.height());
+                println!("   Spatial index: {} entities, {} nodes, {} leaves, depth {}", 
+                        qt_stats.total_entities, qt_stats.total_nodes, qt_stats.leaf_nodes, qt_stats.max_depth_reached);
+                println!("   Query result: {}/{} visible trees ({:.1}% culled)", 
+                        visible_trees.len(), total_trees,
+                        if total_trees > 0 { (total_trees - visible_trees.len()) as f32 / total_trees as f32 * 100.0 } else { 0.0 });
+                DEBUG_TIMER = 0.0;
+            }
+        }
+        
+        // Get quadtree performance statistics
+        let qt_stats = spatial_index.get_stats();
+        
         // Count trees by LOD level
         let mut lod_counts = [0; 4];
         for (_, tree) in tree_query.iter() {
@@ -403,9 +428,13 @@ fn tree_info_display(
 
         let info_text = format!(
             "🌳 PixelTree Demo | FPS: {:.1}\n\
-             Total Trees: {}\n\
-             Visible: {}\n\
+             Total Trees: {} | Visible: {} ({:.1}% culled)\n\
              LOD Levels: H:{} M:{} L:{} Min:{}\n\
+             \n\
+             🌲 Quadtree Stats:\n\
+             Nodes: {} (Leaves: {})\n\
+             Max Depth: {} | Entities: {}\n\
+             \n\
              {}\n\
              {}\n\
              {}\n\
@@ -422,16 +451,22 @@ fn tree_info_display(
              P: Save selected tree (.pt)\n\
              M: iMport tree from .pt file\n\
              F: load PTF Forest\n\
+             T: sTress test (spawn 500 trees)\n\
              \n\
-             Camera: ({:.0}, {:.0})",
+             Camera: ({:.0}, {:.0}) | Zoom: {:.1}x",
             fps_counter.fps,
             total_trees,
             visible_trees.len(),
+            if total_trees > 0 { ((total_trees - visible_trees.len()) as f32 / total_trees as f32) * 100.0 } else { 0.0 },
             lod_counts[0], lod_counts[1], lod_counts[2], lod_counts[3],
+            qt_stats.total_nodes,
+            qt_stats.leaf_nodes,
+            qt_stats.max_depth_reached,
+            qt_stats.total_entities,
             wind_info,
             selection_info,
             shadow_info,
-            camera_pos.x, camera_pos.y
+            camera_pos.x, camera_pos.y, zoom.0
         );
         
         commands.spawn((
@@ -454,34 +489,65 @@ fn render_trees(
 ) {
     if let Ok((camera_transform, zoom)) = camera_query.single() {
         let camera_pos = camera_transform.translation.truncate();
+        let camera_rotation = camera_transform.rotation.to_euler(EulerRot::ZYX).0; // Get Z rotation
         
         // Calculate actual viewport bounds based on window size and zoom
         let viewport_width = 1200.0 / zoom.0; // Actual window width divided by zoom
         let viewport_height = 800.0 / zoom.0; // Actual window height divided by zoom
-        let _viewport_bounds = Rect::from_center_size(
-            camera_pos, 
-            Vec2::new(viewport_width, viewport_height)
-        );
         
         // Add small margin to avoid pop-in
         let margin = 100.0 / zoom.0;
-        let culling_bounds = Rect::from_center_size(
-            camera_pos,
-            Vec2::new(viewport_width + margin * 2.0, viewport_height + margin * 2.0)
-        );
         
+        // For now we'll do individual point tests rather than entity-based culling  
         for (tree_transform, _tree) in tree_query.iter() {
             let tree_pos = tree_transform.translation.truncate();
             
-            // Proper viewport culling - skip trees outside viewport
-            if !culling_bounds.contains(tree_pos) {
-                continue;
+            // Test if tree is visible using appropriate culling method
+            let is_potentially_visible = if camera_rotation.abs() > 0.01 {
+                // For rotated camera, do point-in-frustum test
+                let frustum = pixeltree::ViewFrustum::new(
+                    camera_pos,
+                    Vec2::new(viewport_width + margin * 2.0, viewport_height + margin * 2.0),
+                    camera_rotation
+                );
+                frustum.contains_point(tree_pos)
+            } else {
+                // For axis-aligned camera, do rectangle test
+                let culling_bounds = Rect::from_center_size(
+                    camera_pos,
+                    Vec2::new(viewport_width + margin * 2.0, viewport_height + margin * 2.0)
+                );
+                culling_bounds.contains(tree_pos)
+            };
+            
+            if !is_potentially_visible {
+                continue; // Skip culled trees
             }
             
-            // Trunk rendering is now done via sprites, no gizmo rendering needed
-            
             // Draw tree base circle for debugging visible trees only
-            gizmos.circle_2d(tree_pos, 5.0, Color::srgba(1.0, 1.0, 1.0, 0.3));
+            // Different color based on culling method used
+            let debug_color = if camera_rotation.abs() > 0.01 {
+                Color::srgba(1.0, 0.5, 0.5, 0.6) // Red tint for frustum culling
+            } else {
+                Color::srgba(1.0, 1.0, 1.0, 0.3) // White for rectangular culling
+            };
+            
+            gizmos.circle_2d(tree_pos, 5.0, debug_color);
+        }
+        
+        // Draw camera frustum outline when rotated for debugging
+        if camera_rotation.abs() > 0.01 {
+            let frustum = pixeltree::ViewFrustum::new(
+                camera_pos,
+                Vec2::new(viewport_width, viewport_height),
+                camera_rotation
+            );
+            
+            // Draw frustum corners
+            for i in 0..4 {
+                let j = (i + 1) % 4;
+                gizmos.line_2d(frustum.corners[i], frustum.corners[j], Color::srgb(1.0, 1.0, 0.0));
+            }
         }
     }
 }
@@ -906,6 +972,48 @@ fn tree_selection_system(
                     }
                 }
             }
+        }
+
+        // Handle stress test - spawn lots of trees (T key for Test)
+        if keyboard.just_pressed(KeyCode::KeyT) {
+            let stats_before = spatial_index.get_stats();
+            println!("🌲 STRESS TEST: Before spawning - {} entities in spatial index", stats_before.total_entities);
+            
+            // Generate systematic grid positions with some randomness using time-based seed
+            let time_seed = time.elapsed_secs() as u64;
+            let positions: Vec<Vec2> = (0..500)
+                .map(|i| {
+                    let grid_x = (i % 25) as f32 * 80.0 - 1000.0; // 25x20 grid
+                    let grid_y = (i / 25) as f32 * 100.0 - 1000.0;
+                    // Add some time-based pseudo-randomness
+                    let offset_x = ((time_seed.wrapping_add(i as u64).wrapping_mul(1103515245)) as f32 / u64::MAX as f32) * 40.0 - 20.0;
+                    let offset_y = ((time_seed.wrapping_add(i as u64 * 2).wrapping_mul(12345)) as f32 / u64::MAX as f32) * 40.0 - 20.0;
+                    Vec2::new(grid_x + offset_x, grid_y + offset_y)
+                })
+                .collect();
+            
+            // Create varied tree parameters
+            let stress_params = GenerationParams {
+                height_range: (60.0, 120.0),
+                wind_params: WindParams {
+                    strength: 1.5,
+                    frequency: 1.2,
+                    turbulence: 0.3,
+                    direction: Vec2::new(0.8, 0.3),
+                },
+                branch_angle_variance: 40.0,
+                leaf_density: 2.0,
+                lod_level: 0,
+                ..default()
+            };
+            
+            println!("🌲 Spawning 500 trees via spawn_forest()...");
+            spawn_forest(&mut commands, positions, stress_params, &mut spatial_index);
+            
+            let stats_immediately_after = spatial_index.get_stats();
+            println!("📊 IMMEDIATELY after spawn_forest(): {} entities in spatial index", 
+                    stats_immediately_after.total_entities);
+            println!("   (Note: ECS entities will be processed by update_spatial_index next frame)");
         }
 
         // Handle PTF forest loading (F key for Forest)
@@ -1356,5 +1464,29 @@ fn dynamic_lod_system(
                 tree.lod_level = new_lod;
             }
         }
+    }
+}
+
+/// System to keep the spatial index synchronized with entity positions
+/// This ensures the Quadtree always has up-to-date entity positions for accurate visibility queries
+fn update_spatial_index(
+    // Only handle newly added entities - don't track transform changes since trees animate
+    tree_query: Query<(Entity, &Transform), (With<PixelTree>, Added<PixelTree>)>,
+    mut spatial_index: ResMut<TreeSpatialIndex>,
+) {
+    let count = tree_query.iter().count();
+    if count > 0 {
+        println!("🔧 update_spatial_index: Adding {} NEW entities", count);
+        
+        // Add only newly spawned entities to spatial index
+        for (entity, transform) in tree_query.iter() {
+            let new_position = transform.translation.truncate();
+            spatial_index.update_entity(entity, new_position);
+            println!("   Added entity {:?} at {:?}", entity, new_position);
+        }
+        
+        let stats = spatial_index.get_stats();
+        println!("   After adding: {} total entities, {} nodes, {} max depth", 
+                stats.total_entities, stats.total_nodes, stats.max_depth_reached);
     }
 }
